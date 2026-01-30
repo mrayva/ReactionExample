@@ -1,0 +1,23 @@
+# build artifacts
+/build/
+/build-asan/
+/Testing/
+/.vcpkg_installed/
+/.vcpkg/
+/CMakeFiles/
+/CMakeCache.txt
+Makefile
+
+# editor/IDE files
+.vscode/
+.idea/
+
+# logs and temp files
+*.log
+*.tmp
+
+# sanitizer output / stray files
+0x504000018480
+
+# catch build/test artifacts
+/tests/

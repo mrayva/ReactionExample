@@ -1,7 +1,8 @@
 {
-    "name": "reaction-example",
-    "version-string": "0.1.0",
-    "dependencies": [
-        "reaction"
-    ]
+  "name": "reaction-example",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "reaction",
+    "catch2"
+  ]
 }
