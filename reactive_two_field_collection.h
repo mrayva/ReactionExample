@@ -3,22 +3,6 @@
   reactive_two_field_collection.h
 
   Reactive two-field collection (single-file header).
-
-  Features (finalized):
-    - Two element fields per record (elem1, elem2).
-    - Two reactive totals with Delta/Apply functors.
-    - Aggregate modes: Add, Min, Max (compile-time).
-    - Extractor functors for index-driven totals.
-    - NoopDelta / NoopApply helpers.
-    - Convenience Apply functors: SetApply, SaturatingApply.
-    - Combined-atomic mode (single batched notification for both totals).
-    - Coarse-grained locking: runtime flag and compile-time RequireCoarseLock.
-    - Optional ordered view (MaintainOrderedIndex) using a user 4-arg comparator CompareFn.
-    - Ordered index stored as std::optional<std::set<id,IdComparator>> (no heap indirection).
-    - Ordered iterators (const + mutable), reverse iterators.
-    - top_k / bottom_k helpers and lightweight Top/Bottom-K views (const + mutable).
-    - Min/Max fallback indices implemented via count-maps (std::map<value,count>).
-    - Optimization: avoid erase/insert in ordered index when comparator-equivalent.
 */
 
 #include <algorithm>
@@ -34,6 +18,7 @@
 #include <set>
 #include <memory>
 #include <limits>
+#include <functional>
 #include <reaction/reaction.h>
 
 namespace reactive {
@@ -188,6 +173,9 @@ public:
     static_assert(std::is_default_constructible_v<elem1_type>, "Elem1T must be default-constructible");
     static_assert(std::is_default_constructible_v<elem2_type>, "Elem2T must be default-constructible");
 
+    // runtime comparator function type (accepts elem1, elem2 pairs for two elements)
+    using compare_fn_t = std::function<bool(const elem1_type&, const elem2_type&, const elem1_type&, const elem2_type&)>;
+
     // Per-element record
     struct ElemRecord {
         reaction::Var<elem1_type> elem1Var;
@@ -211,12 +199,12 @@ public:
     using lock_type = std::unique_lock<std::mutex>;
 
     // -------- Ordered-index support types (must be declared early) ----------
-    // IdComparator: calls user CompareFn on element snapshots; tie-break by id
+    // IdComparator: calls runtime compare_fn_t on element snapshots; tie-break by id
     struct IdComparator {
         const ReactiveTwoFieldCollection *parent;
-        CompareFn cmp;
+        compare_fn_t cmp;
         IdComparator() : parent(nullptr), cmp() {}
-        IdComparator(const ReactiveTwoFieldCollection *p, CompareFn c) : parent(p), cmp(std::move(c)) {}
+        IdComparator(const ReactiveTwoFieldCollection *p, compare_fn_t c) : parent(p), cmp(std::move(c)) {}
         bool operator()(const id_type &a, const id_type &b) const {
             if (a == b) return false;
             const ElemRecord &A = parent->elems_.at(a);
@@ -244,7 +232,8 @@ public:
           delta1_(std::move(d1)), apply1_(std::move(a1)),
           delta2_(std::move(d2)), apply2_(std::move(a2)),
           extract1_(), extract2_(),
-          cmp_(),
+          // initialize runtime comparator from the compile-time CompareFn default
+          cmp_(CompareFn{}),
           coarse_lock_enabled_(RequireCoarseLock ? true : coarse_lock), // initialize in same order as member decl
           combined_atomic_(combined_atomic),
           nextId_(1)
@@ -273,6 +262,43 @@ public:
         if constexpr (!std::is_void_v<KeyT>) {
             try { key_index_.clear(); } catch (...) {}
         }
+    }
+
+    // Replace the stored comparator (any callable convertible to compare_fn_t) and rebuild the ordered index atomically.
+    template <typename NewCompare>
+    void set_compare(NewCompare new_cmp) {
+        // Update stored comparator with the same coarse-lock policy used elsewhere
+        if constexpr (RequireCoarseLock) {
+            std::lock_guard<std::mutex> g(coarse_mtx_);
+            cmp_ = compare_fn_t(new_cmp);
+        } else {
+            if (coarse_lock_enabled_) {
+                std::lock_guard<std::mutex> g(coarse_mtx_);
+                cmp_ = compare_fn_t(new_cmp);
+            } else {
+                cmp_ = compare_fn_t(new_cmp);
+            }
+        }
+
+        if constexpr (MaintainOrderedIndex) {
+            std::lock_guard<std::mutex> g(ordered_mtx_);
+            std::optional<ordered_set_type> new_set;
+            new_set.emplace(IdComparator(this, cmp_));
+            for (const auto &kv : elems_) new_set->insert(kv.first);
+            ordered_index_.swap(new_set);
+            // new_set (previous ordered_index_) destructs here
+        }
+    }
+
+    // Rebuild the ordered index using the current runtime comparator (cmp_).
+    // Useful when element state was bulk-updated or comparator semantics are unchanged.
+    void rebuild_ordered_index() {
+        if constexpr (!MaintainOrderedIndex) return;
+        std::lock_guard<std::mutex> g(ordered_mtx_);
+        std::optional<ordered_set_type> new_set;
+        new_set.emplace(IdComparator(this, cmp_));
+        for (const auto &kv : elems_) new_set->insert(kv.first);
+        ordered_index_.swap(new_set);
     }
 
     // Acquire coarse-grained lock (owns the lock only if coarse locking active)
@@ -929,7 +955,8 @@ private:
     Extract1Fn extract1_;
     Extract2Fn extract2_;
 
-    CompareFn cmp_;
+    // runtime comparator (stores any callable convertible to compare_fn_t)
+    compare_fn_t cmp_;
 
     // Underlying storage
     MapType<id_type, ElemRecord> elems_;
