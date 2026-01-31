@@ -27,7 +27,7 @@ int main() {
         detail::DefaultApplyAdd<long>,
         detail::DefaultDelta2<double,long,double>,
         detail::DefaultApplyAdd<double>,
-        void,                    // KeyT
+        std::monostate,          // KeyT
         AggMode::Min,            // Total1Mode -> Min (uses extract1 -> elem2)
         AggMode::Max,            // Total2Mode -> Max (uses extract2 -> elem1*elem2)
         DefaultExtract1<double,long,long>,
@@ -128,7 +128,7 @@ int main() {
         detail::NoopApply<long>,                // Apply1 is noop -> total1 only updated by index logic
         detail::DefaultDelta2<double,long,double>,
         detail::DefaultApplyAdd<double>,
-        void,
+        std::monostate,
         AggMode::Min,                           // total1 min (driven by index)
         AggMode::Add,                           // total2 additive
         DefaultExtract1<double,long,long>,
@@ -155,7 +155,7 @@ int main() {
         detail::SetApply<double>, // apply1 sets total1 to delta (use detail::SetApply)
         detail::DefaultDelta2<double,long,double>,
         detail::DefaultApplyAdd<double>,
-        void,
+        std::monostate,
         AggMode::Add,           // total1 driven by SetApply (not index)
         AggMode::Add,
         DefaultExtract1<double,long,double>,
@@ -182,7 +182,7 @@ int main() {
         detail::DefaultApplyAdd<long>,
         detail::DefaultDelta2<double,long,double>,
         detail::DefaultApplyAdd<double>,
-        void,
+        std::monostate,
         AggMode::Min,
         AggMode::Max,
         DefaultExtract1<double,long,long>,

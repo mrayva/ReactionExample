@@ -1,3 +1,36 @@
+cmake_minimum_required(VERSION 3.20)
+project(ReactionExample CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Compiler warnings
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wsign-conversion
+    )
+endif()
+
+# Find dependencies
+find_package(reaction CONFIG REQUIRED)
+find_package(TBB CONFIG REQUIRED)
+# libcds is header-only, no find_package needed
+find_package(Threads REQUIRED)
+
+# Build main demo executable
+add_executable(demo main.cpp)
+target_link_libraries(demo PRIVATE reaction::reaction TBB::tbb)
+
+# Build lock-free test executable
+add_executable(test_lock_free test_lock_free.cpp)
+target_link_libraries(test_lock_free PRIVATE reaction::reaction TBB::tbb Threads::Threads)
+
 # ---- Tests via vcpkg-provided Catch2 ----
 if (ENABLE_TESTS)
   find_package(Catch2 CONFIG REQUIRED)   # provided by vcpkg

@@ -3,9 +3,17 @@
   reactive_two_field_collection.h
 
   Reactive two-field collection (single-file header).
+  
+  Phase 2: Uses Intel TBB concurrent_hash_map for lock-free map operations.
+  Phase 3: Uses std::shared_mutex for concurrent ordered index (multiple readers, single writer).
 */
 
+//==============================================================================
+// INCLUDES
+//==============================================================================
+
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <cstddef>
 #include <type_traits>
@@ -14,14 +22,26 @@
 #include <variant>
 #include <optional>
 #include <mutex>
+#include <shared_mutex>
 #include <map>
 #include <set>
 #include <memory>
 #include <limits>
 #include <functional>
 #include <reaction/reaction.h>
+#include <oneapi/tbb/concurrent_hash_map.h>
 
 namespace reactive {
+
+//==============================================================================
+// FORWARD DECLARATIONS & ENUMS
+//==============================================================================
+
+enum class AggMode { Add, Min, Max };
+
+//==============================================================================
+// DETAIL NAMESPACE - HELPER FUNCTORS & UTILITIES
+//==============================================================================
 
 namespace detail {
 
@@ -112,8 +132,9 @@ using deduced_delta_t = std::conditional_t<
 
 } // namespace detail
 
-// Aggregate mode
-enum class AggMode { Add, Min, Max };
+// ============================================================================
+// Main Class Declaration
+// ============================================================================
 
 // Default extractors
 template <typename Elem1T, typename Elem2T, typename Total1T>
@@ -139,6 +160,10 @@ struct DefaultCompare {
     }
 };
 
+//==============================================================================
+// MAIN CLASS - REACTIVE TWO-FIELD COLLECTION
+//==============================================================================
+
 template <
     typename Elem1T = double,
     typename Elem2T = long,
@@ -148,7 +173,7 @@ template <
     typename Apply1Fn = detail::DefaultApplyAdd<Total1T, detail::deduced_delta_t<Total1T, Delta1Fn>>,
     typename Delta2Fn = detail::DefaultDelta2<Elem1T, Elem2T, Total2T>,
     typename Apply2Fn = detail::DefaultApplyAdd<Total2T, detail::deduced_delta_t<Total2T, Delta2Fn>>,
-    typename KeyT = void,
+    typename KeyT = std::monostate,
     AggMode Total1Mode = AggMode::Add,
     AggMode Total2Mode = AggMode::Add,
     typename Extract1Fn = DefaultExtract1<Elem1T, Elem2T, Total1T>,
@@ -182,7 +207,7 @@ public:
         reaction::Var<elem2_type> elem2Var;
         elem1_type lastElem1{};
         elem2_type lastElem2{};
-        using key_storage_t = std::conditional_t<std::is_void_v<KeyT>, std::monostate, KeyT>;
+        using key_storage_t = KeyT;  // KeyT is now always monostate or a real type
         key_storage_t key{};
 
         ElemRecord() = default;
@@ -190,12 +215,28 @@ public:
             : elem1Var(std::move(a)), elem2Var(std::move(b)),
               lastElem1(elem1Var.get()), lastElem2(elem2Var.get()), key(std::move(k)) {}
     };
+    
+    // Snapshot of ElemRecord data for ordered iteration (no reactive vars)
+    struct ElemRecordSnapshot {
+        elem1_type lastElem1;
+        elem2_type lastElem2;
+        typename ElemRecord::key_storage_t key;
+    };
 
-    using map_type = MapType<id_type, ElemRecord>;
-    using iterator = typename map_type::iterator;
-    using const_iterator = typename map_type::const_iterator;
-    using value_type = typename map_type::value_type;
-    using key_index_map_type = std::conditional_t<std::is_void_v<KeyT>, std::monostate, MapType<KeyT, id_type>>;
+    // Use TBB concurrent_hash_map for lock-free map operations
+    using elem_map_type = oneapi::tbb::concurrent_hash_map<id_type, ElemRecord>;
+    using monitor_map_type = oneapi::tbb::concurrent_hash_map<id_type, reaction::Action<>>;
+    
+    // key_index always uses concurrent_hash_map (KeyT is monostate when no key needed)
+    using key_index_map_type = oneapi::tbb::concurrent_hash_map<KeyT, id_type>;
+    
+    // Helper to check if keys are used (not monostate)
+    static constexpr bool has_keys = !std::is_same_v<KeyT, std::monostate>;
+    
+    // Legacy type aliases for compatibility  
+    using map_type = elem_map_type;
+    using iterator = typename elem_map_type::iterator;
+    using const_iterator = typename elem_map_type::const_iterator;
     using lock_type = std::unique_lock<std::mutex>;
 
     // -------- Ordered-index support types (must be declared early) ----------
@@ -207,8 +248,13 @@ public:
         IdComparator(const ReactiveTwoFieldCollection *p, compare_fn_t c) : parent(p), cmp(std::move(c)) {}
         bool operator()(const id_type &a, const id_type &b) const {
             if (a == b) return false;
-            const ElemRecord &A = parent->elems_.at(a);
-            const ElemRecord &B = parent->elems_.at(b);
+            // Use concurrent_hash_map accessor for thread-safe lookup
+            typename elem_map_type::const_accessor acc_a, acc_b;
+            if (!parent->elems_.find(acc_a, a) || !parent->elems_.find(acc_b, b)) {
+                return a < b; // fallback if element not found
+            }
+            const ElemRecord &A = acc_a->second;
+            const ElemRecord &B = acc_b->second;
             if (cmp(A.lastElem1, A.lastElem2, B.lastElem1, B.lastElem2)) return true;
             if (cmp(B.lastElem1, B.lastElem2, A.lastElem1, A.lastElem2)) return false;
             return a < b;
@@ -239,8 +285,9 @@ public:
           nextId_(1)
     {
         // Initialize ordered index after elems_ exists (ordered_index_ declared after elems_).
+        // Phase 3: std::shared_mutex allows concurrent reads
         if constexpr (MaintainOrderedIndex) {
-            std::lock_guard<std::mutex> g(ordered_mtx_);
+            std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
             ordered_index_.emplace(IdComparator(this, cmp_));
         }
     }
@@ -253,13 +300,14 @@ public:
         } catch (...) {}
 
         // Destroy ordered index while elems_ and other members are still alive.
+        // Phase 3: Use unique_lock for destruction
         try {
-            std::lock_guard<std::mutex> g(ordered_mtx_);
+            std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
             ordered_index_.reset();
         } catch (...) {}
 
         // Clear key index if present.
-        if constexpr (!std::is_void_v<KeyT>) {
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
             try { key_index_.clear(); } catch (...) {}
         }
     }
@@ -281,10 +329,14 @@ public:
         }
 
         if constexpr (MaintainOrderedIndex) {
-            std::lock_guard<std::mutex> g(ordered_mtx_);
+            // Phase 3: unique_lock for write operations
+            std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
             std::optional<ordered_set_type> new_set;
             new_set.emplace(IdComparator(this, cmp_));
-            for (const auto &kv : elems_) new_set->insert(kv.first);
+            // Iterate over concurrent hash map
+            for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
+                new_set->insert(it->first);
+            }
             ordered_index_.swap(new_set);
             // new_set (previous ordered_index_) destructs here
         }
@@ -294,10 +346,13 @@ public:
     // Useful when element state was bulk-updated or comparator semantics are unchanged.
     void rebuild_ordered_index() {
         if constexpr (!MaintainOrderedIndex) return;
-        std::lock_guard<std::mutex> g(ordered_mtx_);
+        // Phase 3: unique_lock for write operations
+        std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
         std::optional<ordered_set_type> new_set;
         new_set.emplace(IdComparator(this, cmp_));
-        for (const auto &kv : elems_) new_set->insert(kv.first);
+        for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
+            new_set->insert(it->first);
+        }
         ordered_index_.swap(new_set);
     }
 
@@ -328,7 +383,7 @@ public:
         if (vals.empty()) return;
         reaction::batchExecute([this, &vals, keys]() {
             for (size_t i = 0; i < vals.size(); ++i) {
-                if constexpr (std::is_void_v<KeyT>) {
+                if constexpr (std::is_same_v<KeyT, std::monostate>) {
                     push_one_no_batch(vals[i].first, vals[i].second, typename ElemRecord::key_storage_t{});
                 } else {
                     typename ElemRecord::key_storage_t k = (keys && i < keys->size()) ? (*keys)[i] : typename ElemRecord::key_storage_t{};
@@ -341,9 +396,12 @@ public:
     // erase by id
     void erase(id_type id) {
         auto lk = maybe_lock();
-        auto it = elems_.find(id);
-        if (it == elems_.end()) return;
-        ElemRecord &rec = it->second;
+        
+        // Use concurrent_hash_map accessor for thread-safe access
+        typename elem_map_type::accessor acc;
+        if (!elems_.find(acc, id)) return;
+        
+        ElemRecord &rec = acc->second;
 
         std::optional<total1_type> old_ext1;
         std::optional<total2_type> old_ext2;
@@ -352,10 +410,22 @@ public:
 
         delta1_type rem1 = delta1_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
         delta2_type rem2 = delta2_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
+        
+        // Store key before releasing accessor
+        typename ElemRecord::key_storage_t key_to_erase;
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+            key_to_erase = rec.key;
+        }
+        
+        // Release accessor before further operations
+        acc.release();
 
         if constexpr (MaintainOrderedIndex) {
-            std::lock_guard<std::mutex> g(ordered_mtx_);
-            if (ordered_index_) ordered_index_->erase(id);
+            // Phase 3: unique_lock for write operations
+            std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
+            if (ordered_index_) {
+                ordered_index_->erase(id);
+            }
         }
 
         apply_pair(rem1, rem2,
@@ -364,42 +434,46 @@ public:
                    /*have_old2*/ bool(old_ext2), old_ext2 ? &*old_ext2 : nullptr,
                    /*have_new2*/ false, nullptr);
 
-        if constexpr (!std::is_void_v<KeyT>) key_index_.erase(rec.key);
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+            key_index_.erase(key_to_erase);
+        }
 
-        if (auto mit = monitors_.find(id); mit != monitors_.end()) mit->second.close();
-        monitors_.erase(id);
-        elems_.erase(it);
+        // Erase monitor
+        typename monitor_map_type::accessor mon_acc;
+        if (monitors_.find(mon_acc, id)) {
+            mon_acc->second.close();
+            monitors_.erase(mon_acc);
+        }
+        
+        // Finally erase element
+        elems_.erase(id);
+        
+        // Decrement atomic element counter
+        elem_count_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     // erase by key (enabled if KeyT != void)
     template <typename K = KeyT>
-    std::enable_if_t<!std::is_void_v<K>, void>
+    std::enable_if_t<!std::is_same_v<K, std::monostate>, void>
     erase_by_key(const K &k) {
         auto lk = maybe_lock();
-        auto it = key_index_.find(k);
-        if (it == key_index_.end()) return;
-        erase(it->second);
+        typename key_index_map_type::const_accessor acc;
+        if (key_index_.find(acc, k)) {
+            id_type id = acc->second;
+            acc.release();
+            erase(id);
+        }
     }
 
-    // find_by_key (fast) - enabled if KeyT != void
+    // find_by_key (fast) - enabled if KeyT != void, lock-free with concurrent_hash_map
     template <typename K = KeyT>
-    std::enable_if_t<!std::is_void_v<K>, std::optional<id_type>>
+    [[nodiscard]] std::enable_if_t<!std::is_same_v<K, std::monostate>, std::optional<id_type>>
     find_by_key(const K &k) const {
         std::optional<id_type> res;
-        if constexpr (!std::is_void_v<K>) {
-            if constexpr (RequireCoarseLock) {
-                std::lock_guard<std::mutex> g(coarse_mtx_);
-                auto it = key_index_.find(k);
-                if (it != key_index_.end()) res = it->second;
-            } else {
-                if (coarse_lock_enabled_) {
-                    std::lock_guard<std::mutex> g(coarse_mtx_);
-                    auto it = key_index_.find(k);
-                    if (it != key_index_.end()) res = it->second;
-                } else {
-                    auto it = key_index_.find(k);
-                    if (it != key_index_.end()) res = it->second;
-                }
+        if constexpr (!std::is_same_v<K, std::monostate>) {
+            typename key_index_map_type::const_accessor acc;
+            if (key_index_.find(acc, k)) {
+                res = acc->second;
             }
         }
         return res;
@@ -407,36 +481,35 @@ public:
 
     // linear fallback find_by_key (enabled if KeyT != void)
     template <typename K = KeyT>
-    std::enable_if_t<!std::is_void_v<K>, std::optional<id_type>>
+    [[nodiscard]] std::enable_if_t<!std::is_same_v<K, std::monostate>, std::optional<id_type>>
     find_by_key_linear(const K &k) const {
-        if constexpr (RequireCoarseLock) {
-            std::lock_guard<std::mutex> g(coarse_mtx_);
-            for (const auto &kv : elems_) if (kv.second.key == k) return kv.first;
-            return std::nullopt;
-        } else {
-            if (coarse_lock_enabled_) {
-                std::lock_guard<std::mutex> g(coarse_mtx_);
-                for (const auto &kv : elems_) if (kv.second.key == k) return kv.first;
-                return std::nullopt;
-            } else {
-                for (const auto &kv : elems_) if (kv.second.key == k) return kv.first;
-                return std::nullopt;
-            }
+        // Iterate over concurrent_hash_map
+        for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
+            if (it->second.key == k) return it->first;
         }
+        return std::nullopt;
     }
 
-    // Var accessors
+    // Var accessors - thread-safe with concurrent_hash_map
     reaction::Var<elem1_type> &elem1Var(id_type id) {
         auto lk = maybe_lock();
-        return elems_.at(id).elem1Var;
+        typename elem_map_type::accessor acc;
+        if (elems_.find(acc, id)) {
+            return acc->second.elem1Var;
+        }
+        throw std::out_of_range("elem1Var: id not found");
     }
     reaction::Var<elem2_type> &elem2Var(id_type id) {
         auto lk = maybe_lock();
-        return elems_.at(id).elem2Var;
+        typename elem_map_type::accessor acc;
+        if (elems_.find(acc, id)) {
+            return acc->second.elem2Var;
+        }
+        throw std::out_of_range("elem2Var: id not found");
     }
 
-    // totals
-    total1_type total1() const {
+    // totals - optimized: when coarse lock not enabled, direct read (reaction::Var handles thread-safety)
+    [[nodiscard]] total1_type total1() const {
         if constexpr (RequireCoarseLock) {
             std::lock_guard<std::mutex> g(coarse_mtx_);
             return total1_.get();
@@ -445,11 +518,12 @@ public:
                 std::lock_guard<std::mutex> g(coarse_mtx_);
                 return total1_.get();
             } else {
+                // Lock-free fast path - reaction::Var is thread-safe
                 return total1_.get();
             }
         }
     }
-    total2_type total2() const {
+    [[nodiscard]] total2_type total2() const {
         if constexpr (RequireCoarseLock) {
             std::lock_guard<std::mutex> g(coarse_mtx_);
             return total2_.get();
@@ -458,40 +532,21 @@ public:
                 std::lock_guard<std::mutex> g(coarse_mtx_);
                 return total2_.get();
             } else {
+                // Lock-free fast path - reaction::Var is thread-safe
                 return total2_.get();
             }
         }
     }
-    reaction::Var<total1_type> &total1Var() { return total1_; }
-    reaction::Var<total2_type> &total2Var() { return total2_; }
+    [[nodiscard]] reaction::Var<total1_type> &total1Var() { return total1_; }
+    [[nodiscard]] reaction::Var<total2_type> &total2Var() { return total2_; }
 
-    // size / empty
-    size_t size() const noexcept {
-        if constexpr (RequireCoarseLock) {
-            std::lock_guard<std::mutex> g(coarse_mtx_);
-            return elems_.size();
-        } else {
-            if (coarse_lock_enabled_) {
-                std::lock_guard<std::mutex> g(coarse_mtx_);
-                return elems_.size();
-            } else {
-                return elems_.size();
-            }
-        }
+    // size / empty - lock-free using atomic counter
+    [[nodiscard]] size_t size() const noexcept {
+        return elem_count_.load(std::memory_order_relaxed);
     }
 
-    bool empty() const noexcept {
-        if constexpr (RequireCoarseLock) {
-            std::lock_guard<std::mutex> g(coarse_mtx_);
-            return elems_.empty();
-        } else {
-            if (coarse_lock_enabled_) {
-                std::lock_guard<std::mutex> g(coarse_mtx_);
-                return elems_.empty();
-            } else {
-                return elems_.empty();
-            }
-        }
+    [[nodiscard]] bool empty() const noexcept {
+        return elem_count_.load(std::memory_order_relaxed) == 0;
     }
 
     // Basic iteration over the underlying map (id -> ElemRecord)
@@ -502,7 +557,9 @@ public:
     const_iterator cbegin() const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.cbegin(); }
     const_iterator cend()   const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.cend(); }
 
-    // ---------- Ordered-index iterators & helpers ----------
+    //==============================================================================
+    // ORDERED INDEX ITERATORS
+    //==============================================================================
 public:
     using ordered_underlying_it = typename ordered_set_type::iterator;
     using ordered_underlying_const_it = typename ordered_set_type::const_iterator;
@@ -527,10 +584,13 @@ public:
         }
         bool operator!=(const OrderedConstIterator &o) const { return !(*this == o); }
 
-        std::pair<id_type, const ElemRecord&> operator*() const {
+        std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            const ElemRecord &r = parent_->elems_.at(id);
-            return { id, r };
+            typename elem_map_type::const_accessor acc;
+            if (parent_->elems_.find(acc, id)) {
+                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
+            }
+            return { id, {} };
         }
     };
 
@@ -552,10 +612,13 @@ public:
         }
         bool operator!=(const OrderedIterator &o) const { return !(*this == o); }
 
-        std::pair<id_type, ElemRecord&> operator*() const {
+        std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            ElemRecord &r = parent_->elems_.at(id);
-            return { id, r };
+            typename elem_map_type::const_accessor acc;
+            if (parent_->elems_.find(acc, id)) {
+                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
+            }
+            return { id, {} }; // fallback if not found
         }
     };
 
@@ -577,10 +640,13 @@ public:
         }
         bool operator!=(const OrderedConstReverseIterator &o) const { return !(*this == o); }
 
-        std::pair<id_type, const ElemRecord&> operator*() const {
+        std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            const ElemRecord &r = parent_->elems_.at(id);
-            return { id, r };
+            typename elem_map_type::const_accessor acc;
+            if (parent_->elems_.find(acc, id)) {
+                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
+            }
+            return { id, {} };
         }
     };
 
@@ -601,76 +667,88 @@ public:
         }
         bool operator!=(const OrderedReverseIterator &o) const { return !(*this == o); }
 
-        std::pair<id_type, ElemRecord&> operator*() const {
+        std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            ElemRecord &r = parent_->elems_.at(id);
-            return { id, r };
+            typename elem_map_type::const_accessor acc;
+            if (parent_->elems_.find(acc, id)) {
+                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
+            }
+            return { id, {} };
         }
     };
 
     // Ordered iterator accessors (const)
-    OrderedConstIterator ordered_begin() const {
+    [[nodiscard]] OrderedConstIterator ordered_begin() const {
         if constexpr (!MaintainOrderedIndex) return OrderedConstIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedConstIterator();
         return OrderedConstIterator(this, ordered_index_->cbegin());
     }
-    OrderedConstIterator ordered_end() const {
+    [[nodiscard]] OrderedConstIterator ordered_end() const {
         if constexpr (!MaintainOrderedIndex) return OrderedConstIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedConstIterator();
         return OrderedConstIterator(this, ordered_index_->cend());
     }
 
     OrderedConstReverseIterator ordered_rbegin() const {
         if constexpr (!MaintainOrderedIndex) return OrderedConstReverseIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedConstReverseIterator();
         return OrderedConstReverseIterator(this, ordered_index_->crbegin());
     }
     OrderedConstReverseIterator ordered_rend() const {
         if constexpr (!MaintainOrderedIndex) return OrderedConstReverseIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedConstReverseIterator();
         return OrderedConstReverseIterator(this, ordered_index_->crend());
     }
 
     // Ordered iterator accessors (mutable)
-    OrderedIterator ordered_begin() {
+    [[nodiscard]] OrderedIterator ordered_begin() {
         if constexpr (!MaintainOrderedIndex) return OrderedIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedIterator();
         return OrderedIterator(this, ordered_index_->begin());
     }
-    OrderedIterator ordered_end() {
+    [[nodiscard]] OrderedIterator ordered_end() {
         if constexpr (!MaintainOrderedIndex) return OrderedIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedIterator();
         return OrderedIterator(this, ordered_index_->end());
     }
     OrderedReverseIterator ordered_rbegin() {
         if constexpr (!MaintainOrderedIndex) return OrderedReverseIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedReverseIterator();
         return OrderedReverseIterator(this, ordered_index_->rbegin());
     }
     OrderedReverseIterator ordered_rend() {
         if constexpr (!MaintainOrderedIndex) return OrderedReverseIterator();
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return OrderedReverseIterator();
         return OrderedReverseIterator(this, ordered_index_->rend());
     }
 
     // top_k / bottom_k helpers (ids)
-    std::vector<id_type> top_k(size_t k) const {
+    [[nodiscard]] std::vector<id_type> top_k(size_t k) const {
         std::vector<id_type> out;
         if constexpr (!MaintainOrderedIndex) return out;
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return out;
         for (auto it = ordered_index_->rbegin(); it != ordered_index_->rend() && out.size() < k; ++it) out.push_back(*it);
         return out;
     }
-    std::vector<id_type> bottom_k(size_t k) const {
+    [[nodiscard]] std::vector<id_type> bottom_k(size_t k) const {
         std::vector<id_type> out;
         if constexpr (!MaintainOrderedIndex) return out;
+        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
         if (!ordered_index_) return out;
         for (auto it = ordered_index_->begin(); it != ordered_index_->end() && out.size() < k; ++it) out.push_back(*it);
         return out;
     }
 
 private:
-    // Helper to detect default-add ApplyFn types
     static constexpr bool apply1_is_default_add() {
         using default_t = detail::DefaultApplyAdd<Total1T, delta1_type>;
         return std::is_same_v<std::remove_cv_t<std::remove_reference_t<Apply1Fn>>, default_t>;
@@ -850,9 +928,13 @@ private:
         }
     }
 
+    //==============================================================================
+    // ELEMENT INSERTION & MODIFICATION
+    //==============================================================================
+    
     // push helper
-    id_type push_one(elem1_type e1, elem2_type e2, typename ElemRecord::key_storage_t key) {
-        id_type id = nextId_++;
+    [[nodiscard]] id_type push_one(elem1_type e1, elem2_type e2, typename ElemRecord::key_storage_t key) {
+        id_type id = nextId_.fetch_add(1, std::memory_order_relaxed);
 
         reaction::Var<elem1_type> v1 = reaction::var(e1);
         reaction::Var<elem2_type> v2 = reaction::var(e2);
@@ -860,13 +942,26 @@ private:
         ElemRecord rec(std::move(v1), std::move(v2), std::move(key));
         rec.lastElem1 = rec.elem1Var.get();
         rec.lastElem2 = rec.elem2Var.get();
-        elems_.emplace(id, std::move(rec));
+        
+        // Insert into concurrent_hash_map
+        elems_.insert(std::make_pair(id, std::move(rec)));
 
-        if constexpr (!std::is_void_v<KeyT>) key_index_.emplace(elems_.at(id).key, id);
+        // Increment atomic element counter
+        elem_count_.fetch_add(1, std::memory_order_relaxed);
+
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+            typename elem_map_type::const_accessor acc;
+            if (elems_.find(acc, id)) {
+                key_index_.insert(std::make_pair(acc->second.key, id));
+            }
+        }
 
         if constexpr (MaintainOrderedIndex) {
-            std::lock_guard<std::mutex> g(ordered_mtx_);
-            if (ordered_index_) ordered_index_->insert(id);
+            // Phase 3: unique_lock for write operations
+            std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
+            if (ordered_index_) {
+                ordered_index_->insert(id);
+            }
         }
 
         delta1_type d1 = delta1_(e1, e2, elem1_type{}, elem2_type{});
@@ -881,50 +976,74 @@ private:
                    /*old1*/ false, nullptr, /*new1*/ bool(new_ext1), new_ext1 ? &*new_ext1 : nullptr,
                    /*old2*/ false, nullptr, /*new2*/ bool(new_ext2), new_ext2 ? &*new_ext2 : nullptr);
 
+        // Get references to the Vars before creating the monitor
+        typename elem_map_type::accessor acc_for_monitor;
+        if (!elems_.find(acc_for_monitor, id)) {
+            throw std::runtime_error("push_one: element not found after insert");
+        }
+        reaction::Var<elem1_type> &var1_ref = acc_for_monitor->second.elem1Var;
+        reaction::Var<elem2_type> &var2_ref = acc_for_monitor->second.elem2Var;
+        acc_for_monitor.release(); // Release before creating monitor
+
         auto delta1_copy = delta1_;
         auto delta2_copy = delta2_;
         auto extract1_copy = extract1_;
         auto extract2_copy = extract2_;
 
-        monitors_.emplace(id, reaction::action(
+        monitors_.insert(std::make_pair(id, reaction::action(
             [this, id, delta1_copy, delta2_copy, extract1_copy, extract2_copy](elem1_type new1, elem2_type new2) {
-                auto it = elems_.find(id);
-                if (it == elems_.end()) return;
-                ElemRecord &r = it->second;
+                // Use concurrent_hash_map accessor
+                typename elem_map_type::accessor acc;
+                if (!elems_.find(acc, id)) return;
+                ElemRecord &r = acc->second;
 
                 elem1_type ne1 = static_cast<elem1_type>(new1);
                 elem2_type ne2 = static_cast<elem2_type>(new2);
+                
+                // Copy old values before modification
+                elem1_type old_e1 = r.lastElem1;
+                elem2_type old_e2 = r.lastElem2;
 
+                // Check if reordering needed (while holding accessor)
                 bool need_reinsert = true;
                 if constexpr (MaintainOrderedIndex) {
-                    std::lock_guard<std::mutex> g(this->ordered_mtx_);
-                    if (ordered_index_) {
-                        bool equiv = (!cmp_(r.lastElem1, r.lastElem2, ne1, ne2) && !cmp_(ne1, ne2, r.lastElem1, r.lastElem2));
-                        if (!equiv) ordered_index_->erase(id);
-                        else need_reinsert = false;
-                    }
+                    bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
+                    need_reinsert = !equiv;
                 }
 
-                delta1_type dd1 = delta1_copy(ne1, ne2, r.lastElem1, r.lastElem2);
-                delta2_type dd2 = delta2_copy(ne1, ne2, r.lastElem1, r.lastElem2);
+                // Compute deltas
+                delta1_type dd1 = delta1_copy(ne1, ne2, old_e1, old_e2);
+                delta2_type dd2 = delta2_copy(ne1, ne2, old_e1, old_e2);
 
+                // Compute extractors
                 std::optional<total1_type> old_ext1, new_ext1;
                 std::optional<total2_type> old_ext2, new_ext2;
                 if constexpr (Total1Mode != AggMode::Add) {
-                    old_ext1 = extract1_copy(r.lastElem1, r.lastElem2);
+                    old_ext1 = extract1_copy(old_e1, old_e2);
                     new_ext1 = extract1_copy(ne1, ne2);
                 }
                 if constexpr (Total2Mode != AggMode::Add) {
-                    old_ext2 = extract2_copy(r.lastElem1, r.lastElem2);
+                    old_ext2 = extract2_copy(old_e1, old_e2);
                     new_ext2 = extract2_copy(ne1, ne2);
                 }
 
+                // Update values in place
                 r.lastElem1 = ne1;
                 r.lastElem2 = ne2;
+                
+                // Release accessor BEFORE manipulating ordered index
+                acc.release();
 
+                // Update ordered index (may cause IdComparator to acquire new accessors)
+                // Phase 3: unique_lock for write operations
                 if constexpr (MaintainOrderedIndex) {
-                    std::lock_guard<std::mutex> g(this->ordered_mtx_);
-                    if (need_reinsert && ordered_index_) ordered_index_->insert(id);
+                    if (ordered_index_) {
+                        if (need_reinsert) {
+                            std::unique_lock<std::shared_mutex> lock(this->ordered_mtx_);
+                            ordered_index_->erase(id);
+                            ordered_index_->insert(id);
+                        }
+                    }
                 }
 
                 apply_pair(dd1, dd2,
@@ -933,16 +1052,20 @@ private:
                            /*old2*/ bool(old_ext2), old_ext2 ? &*old_ext2 : nullptr,
                            /*new2*/ bool(new_ext2), new_ext2 ? &*new_ext2 : nullptr);
             },
-            elems_.at(id).elem1Var, elems_.at(id).elem2Var
-        ));
+            var1_ref, var2_ref
+        )));
 
         return id;
     }
 
-    id_type push_one_no_batch(const elem1_type &e1, const elem2_type &e2, typename ElemRecord::key_storage_t key) {
+    [[nodiscard]] id_type push_one_no_batch(const elem1_type &e1, const elem2_type &e2, typename ElemRecord::key_storage_t key) {
         return push_one(e1, e2, std::move(key));
     }
 
+    //==============================================================================
+    // MEMBER VARIABLES
+    //==============================================================================
+    
     // Members (order chosen so elems_ outlives ordered_index_ on destruction)
     reaction::Var<total1_type> total1_;
     reaction::Var<total2_type> total2_;
@@ -958,14 +1081,14 @@ private:
     // runtime comparator (stores any callable convertible to compare_fn_t)
     compare_fn_t cmp_;
 
-    // Underlying storage
-    MapType<id_type, ElemRecord> elems_;
-    MapType<id_type, reaction::Action<>> monitors_;
+    // Underlying storage - TBB concurrent hash maps for lock-free operations
+    elem_map_type elems_;
+    monitor_map_type monitors_;
 
     // Ordered index is declared after elems_ so elems_ outlives it during member destruction.
+    // Phase 3: std::shared_mutex for concurrent reads (multiple readers, single writer)
     std::optional<ordered_set_type> ordered_index_;
-    // Mutex protecting ordered_index_ modifications (insert/erase/reset)
-    std::mutex ordered_mtx_;
+    mutable std::shared_mutex ordered_mtx_;  // Reader-writer lock
 
     std::map<total1_type, std::size_t> idx1_;
     std::map<total2_type, std::size_t> idx2_;
@@ -980,7 +1103,10 @@ private:
     key_index_map_type key_index_{};
 
     bool combined_atomic_;
-    id_type nextId_;
+    
+    // Lock-free atomic counters (Phase 1 optimization)
+    std::atomic<id_type> nextId_;
+    std::atomic<size_t> elem_count_{0};
 };
 
 } // namespace reactive

@@ -3,6 +3,7 @@
   "version-string": "0.1.0",
   "dependencies": [
     "reaction",
-    "catch2"
+    "catch2",
+    "tbb"
   ]
 }
