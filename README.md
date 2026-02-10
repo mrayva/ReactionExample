@@ -4,7 +4,7 @@ A high-performance, thread-safe C++20 template library for reactive aggregation 
 
 ## Features
 
-- **Lock-Free Operations**: ID generation, size tracking, and hash map operations use atomic primitives and Intel TBB concurrent data structures
+- **Lock-Free Operations**: ID generation, size tracking, and hash map operations use atomic primitives and parallel-hashmap concurrent data structures
 - **Concurrent Read Access**: Multiple threads can iterate over the ordered index simultaneously (std::shared_mutex)
 - **Reactive Updates**: Automatic aggregate computation via callback system (powered by [reaction library](https://github.com/snncpp/reaction))
 - **Flexible Aggregation**: Support for Add, Min, and Max aggregation modes on two independent totals
@@ -17,7 +17,7 @@ A high-performance, thread-safe C++20 template library for reactive aggregation 
 - **50-100%** improvement under high contention
 - **Lock-free**: ID generation, size(), empty(), hash operations
 - **Concurrent reads**: Multiple readers can iterate simultaneously
-- **O(1) key lookup**: Lock-free via TBB concurrent_hash_map
+- **O(1) key lookup**: Via concurrent parallel_node_hash_map
 
 ### Operation Complexity
 | Operation | Time Complexity | Thread Safety |
@@ -135,7 +135,7 @@ collection.push_one(2.0, 10);  // Prints: "Total changed to: 15"
 ## Requirements
 
 - **C++20** compiler (GCC 10+, Clang 12+, MSVC 2019+)
-- **Intel TBB** (Threading Building Blocks)
+- **parallel-hashmap** (header-only concurrent hash maps)
 - **Reaction library** (reactive programming framework)
 - **vcpkg** (recommended for dependency management)
 
@@ -145,7 +145,7 @@ collection.push_one(2.0, 10);  // Prints: "Total changed to: 15"
 
 ```bash
 # Install dependencies
-vcpkg install tbb reaction
+vcpkg install parallel-hashmap reaction
 
 # Configure with CMake
 cmake -B build -S . \
@@ -160,10 +160,10 @@ cmake --build build
 
 ### Manual Installation
 
-1. Install [Intel TBB](https://github.com/oneapi-src/oneTBB)
+1. Install [parallel-hashmap](https://github.com/greg7mdp/parallel-hashmap) (header-only)
 2. Install [Reaction](https://github.com/snncpp/reaction)
 3. Include `reactive_two_field_collection.h` in your project
-4. Link against TBB and Reaction libraries
+4. Add parallel-hashmap and Reaction to your include paths
 
 ## Architecture
 
@@ -174,8 +174,8 @@ cmake --build build
 │                 Lock-Free Operations                 │
 │  - ID generation (std::atomic)                      │
 │  - size() / empty() (std::atomic)                   │
-│  - Hash operations (TBB concurrent_hash_map)        │
-│  - find_by_key() (TBB concurrent_hash_map)         │
+│  - Hash operations (parallel_node_hash_map)          │
+│  - find_by_key() (parallel_node_hash_map)           │
 └─────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
@@ -274,21 +274,10 @@ This library has undergone three optimization phases:
 | Phase | Improvement | Key Changes |
 |-------|-------------|-------------|
 | **Phase 1** | Atomic counters | Lock-free ID generation and size tracking |
-| **Phase 2** | TBB concurrent maps | Lock-free hash operations, O(1) key lookup |
+| **Phase 2** | Concurrent hash maps | Lock-free hash operations, O(1) key lookup |
 | **Phase 3** | Concurrent reads | Multiple threads can iterate simultaneously |
 
 **Combined**: 50-100% throughput improvement vs baseline under high contention.
-
-See `OPTIMIZATION_SUMMARY.md` for detailed performance analysis.
-
-## Documentation
-
-- **OPTIMIZATION_SUMMARY.md** - Complete performance optimization journey
-- **PHASE1_SUMMARY.md** - Atomic counters implementation
-- **PHASE2_COMPLETE.md** - TBB concurrent hash maps
-- **PHASE3_COMPLETE.md** - Concurrent ordered index
-- **REMAINING_OPTIMIZATIONS.md** - Future improvement opportunities
-- **CODE_QUALITY_IMPROVEMENTS.md** - Code quality and modern C++ suggestions
 
 ## Contributing
 
@@ -304,7 +293,7 @@ Contributions welcome! Please:
 
 ## Acknowledgments
 
-- **Intel TBB**: High-performance concurrent data structures
+- **parallel-hashmap**: High-performance concurrent hash maps
 - **Reaction**: Reactive programming framework
 - **Community**: Thanks to all contributors and users
 
@@ -314,4 +303,4 @@ Contributions welcome! Please:
 
 ---
 
-**Note**: This is a header-only library. Simply include `reactive_two_field_collection.h` and link against TBB and Reaction to get started!
+**Note**: This is a header-only library. Simply include `reactive_two_field_collection.h` and add parallel-hashmap and Reaction to your include paths to get started!
