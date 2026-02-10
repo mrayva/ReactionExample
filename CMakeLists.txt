@@ -19,17 +19,23 @@ endif()
 
 # Find dependencies
 find_package(reaction CONFIG REQUIRED)
-find_package(TBB CONFIG REQUIRED)
-# libcds is header-only, no find_package needed
+find_path(PARALLEL_HASHMAP_INCLUDE_DIRS "parallel_hashmap/phmap.h" REQUIRED)
 find_package(Threads REQUIRED)
 
 # Build main demo executable
 add_executable(demo main.cpp)
-target_link_libraries(demo PRIVATE reaction::reaction TBB::tbb)
+target_link_libraries(demo PRIVATE reaction::reaction)
+target_include_directories(demo PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
 # Build lock-free test executable
 add_executable(test_lock_free test_lock_free.cpp)
-target_link_libraries(test_lock_free PRIVATE reaction::reaction TBB::tbb Threads::Threads)
+target_link_libraries(test_lock_free PRIVATE reaction::reaction Threads::Threads)
+target_include_directories(test_lock_free PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
+
+# Build simple test executable
+add_executable(simple_test simple_test.cpp)
+target_link_libraries(simple_test PRIVATE reaction::reaction)
+target_include_directories(simple_test PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
 # ---- Tests via vcpkg-provided Catch2 ----
 if (ENABLE_TESTS)
@@ -47,7 +53,7 @@ if (ENABLE_TESTS)
     tests/test_reactive_compare.cpp
   )
   target_compile_features(tests_reactive PUBLIC cxx_std_20)
-  target_include_directories(tests_reactive PRIVATE ${PROJECT_SOURCE_DIR})
+  target_include_directories(tests_reactive PRIVATE ${PROJECT_SOURCE_DIR} ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
   target_link_libraries(tests_reactive
     PRIVATE

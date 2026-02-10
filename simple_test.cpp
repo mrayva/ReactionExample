@@ -4,7 +4,7 @@
 using namespace reactive;
 
 int main() {
-    std::cout << "Simple TBB test\n";
+    std::cout << "Simple phmap test\n";
     
     using Coll = ReactiveTwoFieldCollection<
         double, long, long, double,

@@ -4,6 +4,6 @@
   "dependencies": [
     "reaction",
     "catch2",
-    "tbb"
+    "parallel-hashmap"
   ]
 }

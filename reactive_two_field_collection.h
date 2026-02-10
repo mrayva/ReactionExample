@@ -4,7 +4,7 @@
 
   Reactive two-field collection (single-file header).
   
-  Phase 2: Uses Intel TBB concurrent_hash_map for lock-free map operations.
+  Phase 2: Uses parallel-hashmap (phmap) parallel_node_hash_map for concurrent map operations.
   Phase 3: Uses std::shared_mutex for concurrent ordered index (multiple readers, single writer).
 */
 
@@ -29,7 +29,7 @@
 #include <limits>
 #include <functional>
 #include <reaction/reaction.h>
-#include <oneapi/tbb/concurrent_hash_map.h>
+#include <parallel_hashmap/phmap.h>
 
 namespace reactive {
 
@@ -223,12 +223,22 @@ public:
         typename ElemRecord::key_storage_t key;
     };
 
-    // Use TBB concurrent_hash_map for lock-free map operations
-    using elem_map_type = oneapi::tbb::concurrent_hash_map<id_type, ElemRecord>;
-    using monitor_map_type = oneapi::tbb::concurrent_hash_map<id_type, reaction::Action<>>;
-    
-    // key_index always uses concurrent_hash_map (KeyT is monostate when no key needed)
-    using key_index_map_type = oneapi::tbb::concurrent_hash_map<KeyT, id_type>;
+    // Concurrent map type: parallel_node_hash_map preserves pointer/reference stability on rehash.
+    // Uses std::mutex for native builds, phmap::NullMutex for single-threaded WASM.
+private:
+#ifdef __EMSCRIPTEN__
+    using map_mutex_type = phmap::NullMutex;
+#else
+    using map_mutex_type = std::mutex;
+#endif
+    template<typename K, typename V>
+    using concurrent_map_t = phmap::parallel_node_hash_map<
+        K, V, std::hash<K>, std::equal_to<K>,
+        std::allocator<std::pair<const K, V>>, 4, map_mutex_type>;
+public:
+    using elem_map_type = concurrent_map_t<id_type, ElemRecord>;
+    using monitor_map_type = concurrent_map_t<id_type, reaction::Action<>>;
+    using key_index_map_type = concurrent_map_t<KeyT, id_type>;
     
     // Helper to check if keys are used (not monostate)
     static constexpr bool has_keys = !std::is_same_v<KeyT, std::monostate>;
@@ -248,15 +258,19 @@ public:
         IdComparator(const ReactiveTwoFieldCollection *p, compare_fn_t c) : parent(p), cmp(std::move(c)) {}
         bool operator()(const id_type &a, const id_type &b) const {
             if (a == b) return false;
-            // Use concurrent_hash_map accessor for thread-safe lookup
-            typename elem_map_type::const_accessor acc_a, acc_b;
-            if (!parent->elems_.find(acc_a, a) || !parent->elems_.find(acc_b, b)) {
-                return a < b; // fallback if element not found
-            }
-            const ElemRecord &A = acc_a->second;
-            const ElemRecord &B = acc_b->second;
-            if (cmp(A.lastElem1, A.lastElem2, B.lastElem1, B.lastElem2)) return true;
-            if (cmp(B.lastElem1, B.lastElem2, A.lastElem1, A.lastElem2)) return false;
+            // Snapshot element data via sequential if_contains (avoids nested locks on same submap)
+            elem1_type a1{}, b1{};
+            elem2_type a2{}, b2{};
+            bool found_a = false, found_b = false;
+            parent->elems_.if_contains(a, [&](const auto &pair) {
+                a1 = pair.second.lastElem1; a2 = pair.second.lastElem2; found_a = true;
+            });
+            parent->elems_.if_contains(b, [&](const auto &pair) {
+                b1 = pair.second.lastElem1; b2 = pair.second.lastElem2; found_b = true;
+            });
+            if (!found_a || !found_b) return a < b;
+            if (cmp(a1, a2, b1, b2)) return true;
+            if (cmp(b1, b2, a1, a2)) return false;
             return a < b;
         }
     };
@@ -333,7 +347,6 @@ public:
             std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
             std::optional<ordered_set_type> new_set;
             new_set.emplace(IdComparator(this, cmp_));
-            // Iterate over concurrent hash map
             for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
                 new_set->insert(it->first);
             }
@@ -396,29 +409,26 @@ public:
     // erase by id
     void erase(id_type id) {
         auto lk = maybe_lock();
-        
-        // Use concurrent_hash_map accessor for thread-safe access
-        typename elem_map_type::accessor acc;
-        if (!elems_.find(acc, id)) return;
-        
-        ElemRecord &rec = acc->second;
 
+        // Snapshot element data via if_contains
         std::optional<total1_type> old_ext1;
         std::optional<total2_type> old_ext2;
-        if constexpr (Total1Mode != AggMode::Add) old_ext1 = extract1_(rec.lastElem1, rec.lastElem2);
-        if constexpr (Total2Mode != AggMode::Add) old_ext2 = extract2_(rec.lastElem1, rec.lastElem2);
-
-        delta1_type rem1 = delta1_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
-        delta2_type rem2 = delta2_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
-        
-        // Store key before releasing accessor
-        typename ElemRecord::key_storage_t key_to_erase;
-        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
-            key_to_erase = rec.key;
-        }
-        
-        // Release accessor before further operations
-        acc.release();
+        delta1_type rem1{};
+        delta2_type rem2{};
+        typename ElemRecord::key_storage_t key_to_erase{};
+        bool found = false;
+        elems_.if_contains(id, [&](const auto &pair) {
+            const ElemRecord &rec = pair.second;
+            if constexpr (Total1Mode != AggMode::Add) old_ext1 = extract1_(rec.lastElem1, rec.lastElem2);
+            if constexpr (Total2Mode != AggMode::Add) old_ext2 = extract2_(rec.lastElem1, rec.lastElem2);
+            rem1 = delta1_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
+            rem2 = delta2_(elem1_type{}, elem2_type{}, rec.lastElem1, rec.lastElem2);
+            if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+                key_to_erase = rec.key;
+            }
+            found = true;
+        });
+        if (!found) return;
 
         if constexpr (MaintainOrderedIndex) {
             // Phase 3: unique_lock for write operations
@@ -438,12 +448,8 @@ public:
             key_index_.erase(key_to_erase);
         }
 
-        // Erase monitor
-        typename monitor_map_type::accessor mon_acc;
-        if (monitors_.find(mon_acc, id)) {
-            mon_acc->second.close();
-            monitors_.erase(mon_acc);
-        }
+        // Erase monitor: close action inside erase_if callback
+        monitors_.erase_if(id, [](auto &pair) { pair.second.close(); return true; });
         
         // Finally erase element
         elems_.erase(id);
@@ -457,24 +463,23 @@ public:
     std::enable_if_t<!std::is_same_v<K, std::monostate>, void>
     erase_by_key(const K &k) {
         auto lk = maybe_lock();
-        typename key_index_map_type::const_accessor acc;
-        if (key_index_.find(acc, k)) {
-            id_type id = acc->second;
-            acc.release();
-            erase(id);
-        }
+        id_type found_id = 0;
+        bool found = false;
+        key_index_.if_contains(k, [&](const auto &pair) {
+            found_id = pair.second; found = true;
+        });
+        if (found) erase(found_id);
     }
 
-    // find_by_key (fast) - enabled if KeyT != void, lock-free with concurrent_hash_map
+    // find_by_key (fast) - enabled if KeyT != void
     template <typename K = KeyT>
     [[nodiscard]] std::enable_if_t<!std::is_same_v<K, std::monostate>, std::optional<id_type>>
     find_by_key(const K &k) const {
         std::optional<id_type> res;
         if constexpr (!std::is_same_v<K, std::monostate>) {
-            typename key_index_map_type::const_accessor acc;
-            if (key_index_.find(acc, k)) {
-                res = acc->second;
-            }
+            key_index_.if_contains(k, [&](const auto &pair) {
+                res = pair.second;
+            });
         }
         return res;
     }
@@ -483,28 +488,25 @@ public:
     template <typename K = KeyT>
     [[nodiscard]] std::enable_if_t<!std::is_same_v<K, std::monostate>, std::optional<id_type>>
     find_by_key_linear(const K &k) const {
-        // Iterate over concurrent_hash_map
         for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
             if (it->second.key == k) return it->first;
         }
         return std::nullopt;
     }
 
-    // Var accessors - thread-safe with concurrent_hash_map
+    // Var accessors — node-based map guarantees pointer stability after rehash
     reaction::Var<elem1_type> &elem1Var(id_type id) {
         auto lk = maybe_lock();
-        typename elem_map_type::accessor acc;
-        if (elems_.find(acc, id)) {
-            return acc->second.elem1Var;
-        }
+        reaction::Var<elem1_type> *ptr = nullptr;
+        elems_.modify_if(id, [&](auto &pair) { ptr = &pair.second.elem1Var; });
+        if (ptr) return *ptr;
         throw std::out_of_range("elem1Var: id not found");
     }
     reaction::Var<elem2_type> &elem2Var(id_type id) {
         auto lk = maybe_lock();
-        typename elem_map_type::accessor acc;
-        if (elems_.find(acc, id)) {
-            return acc->second.elem2Var;
-        }
+        reaction::Var<elem2_type> *ptr = nullptr;
+        elems_.modify_if(id, [&](auto &pair) { ptr = &pair.second.elem2Var; });
+        if (ptr) return *ptr;
         throw std::out_of_range("elem2Var: id not found");
     }
 
@@ -586,11 +588,11 @@ public:
 
         std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            typename elem_map_type::const_accessor acc;
-            if (parent_->elems_.find(acc, id)) {
-                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
-            }
-            return { id, {} };
+            ElemRecordSnapshot snap{};
+            parent_->elems_.if_contains(id, [&](const auto &pair) {
+                snap = {pair.second.lastElem1, pair.second.lastElem2, pair.second.key};
+            });
+            return { id, snap };
         }
     };
 
@@ -614,11 +616,11 @@ public:
 
         std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            typename elem_map_type::const_accessor acc;
-            if (parent_->elems_.find(acc, id)) {
-                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
-            }
-            return { id, {} }; // fallback if not found
+            ElemRecordSnapshot snap{};
+            parent_->elems_.if_contains(id, [&](const auto &pair) {
+                snap = {pair.second.lastElem1, pair.second.lastElem2, pair.second.key};
+            });
+            return { id, snap };
         }
     };
 
@@ -642,11 +644,11 @@ public:
 
         std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            typename elem_map_type::const_accessor acc;
-            if (parent_->elems_.find(acc, id)) {
-                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
-            }
-            return { id, {} };
+            ElemRecordSnapshot snap{};
+            parent_->elems_.if_contains(id, [&](const auto &pair) {
+                snap = {pair.second.lastElem1, pair.second.lastElem2, pair.second.key};
+            });
+            return { id, snap };
         }
     };
 
@@ -669,11 +671,11 @@ public:
 
         std::pair<id_type, ElemRecordSnapshot> operator*() const {
             id_type id = *it_;
-            typename elem_map_type::const_accessor acc;
-            if (parent_->elems_.find(acc, id)) {
-                return { id, {acc->second.lastElem1, acc->second.lastElem2, acc->second.key} };
-            }
-            return { id, {} };
+            ElemRecordSnapshot snap{};
+            parent_->elems_.if_contains(id, [&](const auto &pair) {
+                snap = {pair.second.lastElem1, pair.second.lastElem2, pair.second.key};
+            });
+            return { id, snap };
         }
     };
 
@@ -943,17 +945,16 @@ private:
         rec.lastElem1 = rec.elem1Var.get();
         rec.lastElem2 = rec.elem2Var.get();
         
-        // Insert into concurrent_hash_map
         elems_.insert(std::make_pair(id, std::move(rec)));
 
         // Increment atomic element counter
         elem_count_.fetch_add(1, std::memory_order_relaxed);
 
         if constexpr (!std::is_same_v<KeyT, std::monostate>) {
-            typename elem_map_type::const_accessor acc;
-            if (elems_.find(acc, id)) {
-                key_index_.insert(std::make_pair(acc->second.key, id));
-            }
+            // Copy key outside callback to avoid nested cross-map locks
+            typename ElemRecord::key_storage_t inserted_key{};
+            elems_.if_contains(id, [&](const auto &pair) { inserted_key = pair.second.key; });
+            key_index_.insert(std::make_pair(std::move(inserted_key), id));
         }
 
         if constexpr (MaintainOrderedIndex) {
@@ -976,14 +977,18 @@ private:
                    /*old1*/ false, nullptr, /*new1*/ bool(new_ext1), new_ext1 ? &*new_ext1 : nullptr,
                    /*old2*/ false, nullptr, /*new2*/ bool(new_ext2), new_ext2 ? &*new_ext2 : nullptr);
 
-        // Get references to the Vars before creating the monitor
-        typename elem_map_type::accessor acc_for_monitor;
-        if (!elems_.find(acc_for_monitor, id)) {
+        // Get stable pointers to the Vars (node-based map guarantees pointer stability)
+        reaction::Var<elem1_type> *var1_ptr = nullptr;
+        reaction::Var<elem2_type> *var2_ptr = nullptr;
+        elems_.modify_if(id, [&](auto &pair) {
+            var1_ptr = &pair.second.elem1Var;
+            var2_ptr = &pair.second.elem2Var;
+        });
+        if (!var1_ptr || !var2_ptr) {
             throw std::runtime_error("push_one: element not found after insert");
         }
-        reaction::Var<elem1_type> &var1_ref = acc_for_monitor->second.elem1Var;
-        reaction::Var<elem2_type> &var2_ref = acc_for_monitor->second.elem2Var;
-        acc_for_monitor.release(); // Release before creating monitor
+        reaction::Var<elem1_type> &var1_ref = *var1_ptr;
+        reaction::Var<elem2_type> &var2_ref = *var2_ptr;
 
         auto delta1_copy = delta1_;
         auto delta2_copy = delta2_;
@@ -992,50 +997,48 @@ private:
 
         monitors_.insert(std::make_pair(id, reaction::action(
             [this, id, delta1_copy, delta2_copy, extract1_copy, extract2_copy](elem1_type new1, elem2_type new2) {
-                // Use concurrent_hash_map accessor
-                typename elem_map_type::accessor acc;
-                if (!elems_.find(acc, id)) return;
-                ElemRecord &r = acc->second;
-
                 elem1_type ne1 = static_cast<elem1_type>(new1);
                 elem2_type ne2 = static_cast<elem2_type>(new2);
-                
-                // Copy old values before modification
-                elem1_type old_e1 = r.lastElem1;
-                elem2_type old_e2 = r.lastElem2;
 
-                // Check if reordering needed (while holding accessor)
+                // Compute all values inside modify_if; ordered index & apply_pair stay outside
+                elem1_type old_e1{};
+                elem2_type old_e2{};
                 bool need_reinsert = true;
-                if constexpr (MaintainOrderedIndex) {
-                    bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
-                    need_reinsert = !equiv;
-                }
-
-                // Compute deltas
-                delta1_type dd1 = delta1_copy(ne1, ne2, old_e1, old_e2);
-                delta2_type dd2 = delta2_copy(ne1, ne2, old_e1, old_e2);
-
-                // Compute extractors
+                delta1_type dd1{};
+                delta2_type dd2{};
                 std::optional<total1_type> old_ext1, new_ext1;
                 std::optional<total2_type> old_ext2, new_ext2;
-                if constexpr (Total1Mode != AggMode::Add) {
-                    old_ext1 = extract1_copy(old_e1, old_e2);
-                    new_ext1 = extract1_copy(ne1, ne2);
-                }
-                if constexpr (Total2Mode != AggMode::Add) {
-                    old_ext2 = extract2_copy(old_e1, old_e2);
-                    new_ext2 = extract2_copy(ne1, ne2);
-                }
+                bool found = false;
 
-                // Update values in place
-                r.lastElem1 = ne1;
-                r.lastElem2 = ne2;
-                
-                // Release accessor BEFORE manipulating ordered index
-                acc.release();
+                elems_.modify_if(id, [&](auto &pair) {
+                    ElemRecord &r = pair.second;
+                    old_e1 = r.lastElem1;
+                    old_e2 = r.lastElem2;
 
-                // Update ordered index (may cause IdComparator to acquire new accessors)
-                // Phase 3: unique_lock for write operations
+                    if constexpr (MaintainOrderedIndex) {
+                        bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
+                        need_reinsert = !equiv;
+                    }
+
+                    dd1 = delta1_copy(ne1, ne2, old_e1, old_e2);
+                    dd2 = delta2_copy(ne1, ne2, old_e1, old_e2);
+
+                    if constexpr (Total1Mode != AggMode::Add) {
+                        old_ext1 = extract1_copy(old_e1, old_e2);
+                        new_ext1 = extract1_copy(ne1, ne2);
+                    }
+                    if constexpr (Total2Mode != AggMode::Add) {
+                        old_ext2 = extract2_copy(old_e1, old_e2);
+                        new_ext2 = extract2_copy(ne1, ne2);
+                    }
+
+                    r.lastElem1 = ne1;
+                    r.lastElem2 = ne2;
+                    found = true;
+                });
+                if (!found) return;
+
+                // Update ordered index outside the element lock
                 if constexpr (MaintainOrderedIndex) {
                     if (ordered_index_) {
                         if (need_reinsert) {
@@ -1081,7 +1084,7 @@ private:
     // runtime comparator (stores any callable convertible to compare_fn_t)
     compare_fn_t cmp_;
 
-    // Underlying storage - TBB concurrent hash maps for lock-free operations
+    // Underlying storage - parallel-hashmap concurrent node maps
     elem_map_type elems_;
     monitor_map_type monitors_;
 
