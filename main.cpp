@@ -54,9 +54,12 @@ int main() {
     [[maybe_unused]] auto id5 = c.push_back(2.5, 20); // duplicate extractor values to test count-map
 
     std::cout << "\nInitial ordered (smallest -> largest) by comparator (elem1, elem2):\n";
-    for (auto it = c.ordered_begin(); it != c.ordered_end(); ++it) {
-        auto [id, rec] = *it;
-        std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+    {
+        auto ordered1 = c.ordered();
+        for (auto it = ordered1.begin(); it != ordered1.end(); ++it) {
+            auto [id, rec] = *it;
+            std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+        }
     }
 
     // Totals: total1 == min(elem2) -> expected 5; total2 == max(elem1*elem2)
@@ -78,7 +81,8 @@ int main() {
     std::cout << "\nTop 3 elements (by comparator, largest-first):\n";
     {
         int count = 0;
-        for (auto it = c.ordered_rbegin(); it != c.ordered_rend() && count < 3; ++it, ++count) {
+        auto ordered2 = c.ordered();
+        for (auto it = ordered2.rbegin(); it != ordered2.rend() && count < 3; ++it, ++count) {
             auto [id, rec] = *it;
             std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
         }
@@ -88,7 +92,8 @@ int main() {
     std::cout << "\nBottom 3 elements (smallest-first):\n";
     {
         int count = 0;
-        for (auto it = c.ordered_begin(); it != c.ordered_end() && count < 3; ++it, ++count) {
+        auto ordered3 = c.ordered();
+        for (auto it = ordered3.begin(); it != ordered3.end() && count < 3; ++it, ++count) {
             auto [id, rec] = *it;
             std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
         }
@@ -99,9 +104,12 @@ int main() {
     c.elem2Var(id1).value(30);
 
     std::cout << "After update ordered (smallest -> largest):\n";
-    for (auto it = c.ordered_begin(); it != c.ordered_end(); ++it) {
-        auto [id, rec] = *it;
-        std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+    {
+        auto ordered4 = c.ordered();
+        for (auto it = ordered4.begin(); it != ordered4.end(); ++it) {
+            auto [id, rec] = *it;
+            std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+        }
     }
 
     std::cout << "Totals now: total1(min elem2)=" << c.total1() << " total2(max elem1*elem2)=" << c.total2() << "\n";
@@ -113,9 +121,12 @@ int main() {
     c.elem1Var(id3).value(0.7);
 
     std::cout << "Ordered after id3.elem1 update:\n";
-    for (auto it = c.ordered_begin(); it != c.ordered_end(); ++it) {
-        auto [id, rec] = *it;
-        std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+    {
+        auto ordered5 = c.ordered();
+        for (auto it = ordered5.begin(); it != ordered5.end(); ++it) {
+            auto [id, rec] = *it;
+            std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
+        }
     }
 
     // ----------------------------
@@ -214,7 +225,8 @@ int main() {
     std::cout << "cc top 5 (id,elem1,elem2):\n";
     {
         int count = 0;
-        for (auto it = cc.ordered_rbegin(); it != cc.ordered_rend() && count < 5; ++it, ++count) {
+        auto ordered6 = cc.ordered();
+        for (auto it = ordered6.rbegin(); it != ordered6.rend() && count < 5; ++it, ++count) {
             auto [id, rec] = *it;
             std::cout << " id=" << id << " e1=" << rec.lastElem1 << " e2=" << rec.lastElem2 << "\n";
         }

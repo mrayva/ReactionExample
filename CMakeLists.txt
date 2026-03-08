@@ -3,6 +3,7 @@ project(ReactionExample CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+option(ENABLE_TESTS "Build and register tests" ON)
 
 # Compiler warnings
 if(MSVC)
@@ -37,30 +38,17 @@ add_executable(simple_test simple_test.cpp)
 target_link_libraries(simple_test PRIVATE reaction::reaction)
 target_include_directories(simple_test PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
-# ---- Tests via vcpkg-provided Catch2 ----
-if (ENABLE_TESTS)
-  find_package(Catch2 CONFIG REQUIRED)   # provided by vcpkg
+# Build regression tests executable
+add_executable(regression_tests regression_tests.cpp)
+target_link_libraries(regression_tests PRIVATE reaction::reaction Threads::Threads)
+target_include_directories(regression_tests PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
-  # ensure Threads target exists
-  find_package(Threads REQUIRED)
+if(ENABLE_TESTS)
+  include(CTest)
+  enable_testing()
 
-  # find the reaction package (vcpkg should provide a reactionConfig.cmake)
-  find_package(reaction CONFIG REQUIRED)
-
-  add_executable(tests_reactive
-    tests/test_reactive_collection.cpp
-    tests/test_reactive_collection_extra.cpp
-    tests/test_reactive_compare.cpp
-  )
-  target_compile_features(tests_reactive PUBLIC cxx_std_20)
-  target_include_directories(tests_reactive PRIVATE ${PROJECT_SOURCE_DIR} ${PARALLEL_HASHMAP_INCLUDE_DIRS})
-
-  target_link_libraries(tests_reactive
-    PRIVATE
-      reaction::reaction
-      Threads::Threads
-      Catch2::Catch2WithMain
-  )
-
-  add_test(NAME reactive_unit_tests COMMAND $<TARGET_FILE:tests_reactive>)
+  add_test(NAME simple_test_smoke COMMAND $<TARGET_FILE:simple_test>)
+  add_test(NAME demo_smoke COMMAND $<TARGET_FILE:demo>)
+  add_test(NAME lock_free_regression COMMAND $<TARGET_FILE:test_lock_free>)
+  add_test(NAME api_regression COMMAND $<TARGET_FILE:regression_tests>)
 endif()

@@ -28,6 +28,8 @@
 #include <memory>
 #include <limits>
 #include <functional>
+#include <stdexcept>
+#include <unordered_set>
 #include <reaction/reaction.h>
 #include <parallel_hashmap/phmap.h>
 
@@ -247,6 +249,7 @@ public:
     using map_type = elem_map_type;
     using iterator = typename elem_map_type::iterator;
     using const_iterator = typename elem_map_type::const_iterator;
+    using ordered_lock_ptr = std::shared_ptr<std::shared_lock<std::shared_mutex>>;
     using lock_type = std::unique_lock<std::mutex>;
 
     // -------- Ordered-index support types (must be declared early) ----------
@@ -329,22 +332,10 @@ public:
     // Replace the stored comparator (any callable convertible to compare_fn_t) and rebuild the ordered index atomically.
     template <typename NewCompare>
     void set_compare(NewCompare new_cmp) {
-        // Update stored comparator with the same coarse-lock policy used elsewhere
-        if constexpr (RequireCoarseLock) {
-            std::lock_guard<std::mutex> g(coarse_mtx_);
-            cmp_ = compare_fn_t(new_cmp);
-        } else {
-            if (coarse_lock_enabled_) {
-                std::lock_guard<std::mutex> g(coarse_mtx_);
-                cmp_ = compare_fn_t(new_cmp);
-            } else {
-                cmp_ = compare_fn_t(new_cmp);
-            }
-        }
-
         if constexpr (MaintainOrderedIndex) {
             // Phase 3: unique_lock for write operations
             std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
+            cmp_ = compare_fn_t(new_cmp);
             std::optional<ordered_set_type> new_set;
             new_set.emplace(IdComparator(this, cmp_));
             for (typename elem_map_type::const_iterator it = elems_.begin(); it != elems_.end(); ++it) {
@@ -352,6 +343,19 @@ public:
             }
             ordered_index_.swap(new_set);
             // new_set (previous ordered_index_) destructs here
+        } else {
+            // No ordered index: keep coarse-lock policy unchanged for compatibility.
+            if constexpr (RequireCoarseLock) {
+                std::lock_guard<std::mutex> g(coarse_mtx_);
+                cmp_ = compare_fn_t(new_cmp);
+            } else {
+                if (coarse_lock_enabled_) {
+                    std::lock_guard<std::mutex> g(coarse_mtx_);
+                    cmp_ = compare_fn_t(new_cmp);
+                } else {
+                    cmp_ = compare_fn_t(new_cmp);
+                }
+            }
         }
     }
 
@@ -394,13 +398,43 @@ public:
     void push_back(const std::vector<std::pair<elem1_type, elem2_type>> &vals, const std::vector<key_type> *keys = nullptr) {
         auto lk = maybe_lock();
         if (vals.empty()) return;
+
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+            std::vector<typename ElemRecord::key_storage_t> batch_keys;
+            batch_keys.reserve(vals.size());
+            for (size_t i = 0; i < vals.size(); ++i) {
+                typename ElemRecord::key_storage_t k =
+                    (keys && i < keys->size()) ? (*keys)[i] : typename ElemRecord::key_storage_t{};
+                batch_keys.push_back(std::move(k));
+            }
+
+            // Fail before writes if the batch itself contains duplicate keys.
+            std::unordered_set<typename ElemRecord::key_storage_t> unique_keys;
+            unique_keys.reserve(batch_keys.size());
+            for (const auto &k : batch_keys) {
+                auto [_, inserted] = unique_keys.insert(k);
+                if (!inserted) {
+                    throw std::invalid_argument("push_back(batch): duplicate key in batch");
+                }
+            }
+
+            // Fail before writes if any key already exists.
+            for (const auto &k : batch_keys) {
+                bool exists = false;
+                key_index_.if_contains(k, [&](const auto &) { exists = true; });
+                if (exists) {
+                    throw std::invalid_argument("push_back(batch): key already exists");
+                }
+            }
+        }
+
         reaction::batchExecute([this, &vals, keys]() {
             for (size_t i = 0; i < vals.size(); ++i) {
                 if constexpr (std::is_same_v<KeyT, std::monostate>) {
-                    push_one_no_batch(vals[i].first, vals[i].second, typename ElemRecord::key_storage_t{});
+                    (void)push_one_no_batch(vals[i].first, vals[i].second, typename ElemRecord::key_storage_t{});
                 } else {
                     typename ElemRecord::key_storage_t k = (keys && i < keys->size()) ? (*keys)[i] : typename ElemRecord::key_storage_t{};
-                    push_one_no_batch(vals[i].first, vals[i].second, std::move(k));
+                    (void)push_one_no_batch(vals[i].first, vals[i].second, std::move(k));
                 }
             }
         });
@@ -462,7 +496,6 @@ public:
     template <typename K = KeyT>
     std::enable_if_t<!std::is_same_v<K, std::monostate>, void>
     erase_by_key(const K &k) {
-        auto lk = maybe_lock();
         id_type found_id = 0;
         bool found = false;
         key_index_.if_contains(k, [&](const auto &pair) {
@@ -551,13 +584,14 @@ public:
         return elem_count_.load(std::memory_order_relaxed) == 0;
     }
 
-    // Basic iteration over the underlying map (id -> ElemRecord)
-    iterator begin() { auto lk = maybe_lock(); return elems_.begin(); }
-    iterator end()   { auto lk = maybe_lock(); return elems_.end(); }
-    const_iterator begin() const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.begin(); }
-    const_iterator end()   const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.end(); }
-    const_iterator cbegin() const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.cbegin(); }
-    const_iterator cend()   const { if constexpr (RequireCoarseLock) std::lock_guard<std::mutex> g(coarse_mtx_); return elems_.cend(); }
+    // Basic iteration over the underlying map (id -> ElemRecord).
+    // NOTE: these iterators are not externally synchronized.
+    iterator begin() { return elems_.begin(); }
+    iterator end()   { return elems_.end(); }
+    const_iterator begin() const { return elems_.begin(); }
+    const_iterator end()   const { return elems_.end(); }
+    const_iterator cbegin() const { return elems_.cbegin(); }
+    const_iterator cend()   const { return elems_.cend(); }
 
     //==============================================================================
     // ORDERED INDEX ITERATORS
@@ -572,9 +606,11 @@ public:
     class OrderedConstIterator {
         ordered_underlying_const_it it_;
         const ReactiveTwoFieldCollection *parent_;
+        ordered_lock_ptr lock_;
     public:
-        OrderedConstIterator() : it_(), parent_(nullptr) {}
-        OrderedConstIterator(const ReactiveTwoFieldCollection *p, ordered_underlying_const_it it) : it_(it), parent_(p) {}
+        OrderedConstIterator() : it_(), parent_(nullptr), lock_() {}
+        OrderedConstIterator(const ReactiveTwoFieldCollection *p, ordered_underlying_const_it it, ordered_lock_ptr lock)
+            : it_(it), parent_(p), lock_(std::move(lock)) {}
 
         OrderedConstIterator& operator++() { ++it_; return *this; }
         OrderedConstIterator operator++(int) { OrderedConstIterator tmp = *this; ++it_; return tmp; }
@@ -600,9 +636,11 @@ public:
     class OrderedIterator {
         ordered_underlying_it it_;
         ReactiveTwoFieldCollection *parent_;
+        ordered_lock_ptr lock_;
     public:
-        OrderedIterator() : it_(), parent_(nullptr) {}
-        OrderedIterator(ReactiveTwoFieldCollection *p, ordered_underlying_it it) : it_(it), parent_(p) {}
+        OrderedIterator() : it_(), parent_(nullptr), lock_() {}
+        OrderedIterator(ReactiveTwoFieldCollection *p, ordered_underlying_it it, ordered_lock_ptr lock)
+            : it_(it), parent_(p), lock_(std::move(lock)) {}
 
         OrderedIterator& operator++() { ++it_; return *this; }
         OrderedIterator operator++(int) { OrderedIterator tmp = *this; ++it_; return tmp; }
@@ -628,9 +666,11 @@ public:
     class OrderedConstReverseIterator {
         ordered_underlying_const_rit it_;
         const ReactiveTwoFieldCollection *parent_;
+        ordered_lock_ptr lock_;
     public:
-        OrderedConstReverseIterator() : it_(), parent_(nullptr) {}
-        OrderedConstReverseIterator(const ReactiveTwoFieldCollection *p, ordered_underlying_const_rit it) : it_(it), parent_(p) {}
+        OrderedConstReverseIterator() : it_(), parent_(nullptr), lock_() {}
+        OrderedConstReverseIterator(const ReactiveTwoFieldCollection *p, ordered_underlying_const_rit it, ordered_lock_ptr lock)
+            : it_(it), parent_(p), lock_(std::move(lock)) {}
 
         OrderedConstReverseIterator& operator++() { ++it_; return *this; }
         OrderedConstReverseIterator operator++(int) { OrderedConstReverseIterator tmp = *this; ++it_; return tmp; }
@@ -655,9 +695,11 @@ public:
     class OrderedReverseIterator {
         ordered_underlying_rit it_;
         ReactiveTwoFieldCollection *parent_;
+        ordered_lock_ptr lock_;
     public:
-        OrderedReverseIterator() : it_(), parent_(nullptr) {}
-        OrderedReverseIterator(ReactiveTwoFieldCollection *p, ordered_underlying_rit it) : it_(it), parent_(p) {}
+        OrderedReverseIterator() : it_(), parent_(nullptr), lock_() {}
+        OrderedReverseIterator(ReactiveTwoFieldCollection *p, ordered_underlying_rit it, ordered_lock_ptr lock)
+            : it_(it), parent_(p), lock_(std::move(lock)) {}
 
         OrderedReverseIterator& operator++() { ++it_; return *this; }
         OrderedReverseIterator operator++(int) { OrderedReverseIterator tmp = *this; ++it_; return tmp; }
@@ -679,57 +721,67 @@ public:
         }
     };
 
-    // Ordered iterator accessors (const)
-    [[nodiscard]] OrderedConstIterator ordered_begin() const {
-        if constexpr (!MaintainOrderedIndex) return OrderedConstIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedConstIterator();
-        return OrderedConstIterator(this, ordered_index_->cbegin());
-    }
-    [[nodiscard]] OrderedConstIterator ordered_end() const {
-        if constexpr (!MaintainOrderedIndex) return OrderedConstIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedConstIterator();
-        return OrderedConstIterator(this, ordered_index_->cend());
+    // Lock-owning ordered views for safe ordered iteration under concurrent writers.
+    class OrderedConstRange {
+        const ReactiveTwoFieldCollection *parent_;
+        ordered_underlying_const_it begin_;
+        ordered_underlying_const_it end_;
+        ordered_underlying_const_rit rbegin_;
+        ordered_underlying_const_rit rend_;
+        ordered_lock_ptr lock_;
+    public:
+        OrderedConstRange() : parent_(nullptr), begin_(), end_(), rbegin_(), rend_(), lock_() {}
+        OrderedConstRange(const ReactiveTwoFieldCollection *p,
+                          ordered_underlying_const_it b,
+                          ordered_underlying_const_it e,
+                          ordered_underlying_const_rit rb,
+                          ordered_underlying_const_rit re,
+                          ordered_lock_ptr lock)
+            : parent_(p), begin_(b), end_(e), rbegin_(rb), rend_(re), lock_(std::move(lock)) {}
+
+        OrderedConstIterator begin() const { return OrderedConstIterator(parent_, begin_, lock_); }
+        OrderedConstIterator end() const { return OrderedConstIterator(parent_, end_, lock_); }
+        OrderedConstReverseIterator rbegin() const { return OrderedConstReverseIterator(parent_, rbegin_, lock_); }
+        OrderedConstReverseIterator rend() const { return OrderedConstReverseIterator(parent_, rend_, lock_); }
+    };
+
+    class OrderedRange {
+        ReactiveTwoFieldCollection *parent_;
+        ordered_underlying_it begin_;
+        ordered_underlying_it end_;
+        ordered_underlying_rit rbegin_;
+        ordered_underlying_rit rend_;
+        ordered_lock_ptr lock_;
+    public:
+        OrderedRange() : parent_(nullptr), begin_(), end_(), rbegin_(), rend_(), lock_() {}
+        OrderedRange(ReactiveTwoFieldCollection *p,
+                     ordered_underlying_it b,
+                     ordered_underlying_it e,
+                     ordered_underlying_rit rb,
+                     ordered_underlying_rit re,
+                     ordered_lock_ptr lock)
+            : parent_(p), begin_(b), end_(e), rbegin_(rb), rend_(re), lock_(std::move(lock)) {}
+
+        OrderedIterator begin() const { return OrderedIterator(parent_, begin_, lock_); }
+        OrderedIterator end() const { return OrderedIterator(parent_, end_, lock_); }
+        OrderedReverseIterator rbegin() const { return OrderedReverseIterator(parent_, rbegin_, lock_); }
+        OrderedReverseIterator rend() const { return OrderedReverseIterator(parent_, rend_, lock_); }
+    };
+
+    [[nodiscard]] OrderedConstRange ordered() const {
+        if constexpr (!MaintainOrderedIndex) return OrderedConstRange();
+        auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(ordered_mtx_);
+        if (!ordered_index_) return OrderedConstRange();
+        return OrderedConstRange(this, ordered_index_->cbegin(), ordered_index_->cend(),
+                                 ordered_index_->crbegin(), ordered_index_->crend(), lock);
     }
 
-    OrderedConstReverseIterator ordered_rbegin() const {
-        if constexpr (!MaintainOrderedIndex) return OrderedConstReverseIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedConstReverseIterator();
-        return OrderedConstReverseIterator(this, ordered_index_->crbegin());
-    }
-    OrderedConstReverseIterator ordered_rend() const {
-        if constexpr (!MaintainOrderedIndex) return OrderedConstReverseIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedConstReverseIterator();
-        return OrderedConstReverseIterator(this, ordered_index_->crend());
-    }
-
-    // Ordered iterator accessors (mutable)
-    [[nodiscard]] OrderedIterator ordered_begin() {
-        if constexpr (!MaintainOrderedIndex) return OrderedIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedIterator();
-        return OrderedIterator(this, ordered_index_->begin());
-    }
-    [[nodiscard]] OrderedIterator ordered_end() {
-        if constexpr (!MaintainOrderedIndex) return OrderedIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedIterator();
-        return OrderedIterator(this, ordered_index_->end());
-    }
-    OrderedReverseIterator ordered_rbegin() {
-        if constexpr (!MaintainOrderedIndex) return OrderedReverseIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedReverseIterator();
-        return OrderedReverseIterator(this, ordered_index_->rbegin());
-    }
-    OrderedReverseIterator ordered_rend() {
-        if constexpr (!MaintainOrderedIndex) return OrderedReverseIterator();
-        std::shared_lock<std::shared_mutex> lock(ordered_mtx_);
-        if (!ordered_index_) return OrderedReverseIterator();
-        return OrderedReverseIterator(this, ordered_index_->rend());
+    [[nodiscard]] OrderedRange ordered() {
+        if constexpr (!MaintainOrderedIndex) return OrderedRange();
+        auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(ordered_mtx_);
+        if (!ordered_index_) return OrderedRange();
+        return OrderedRange(this, ordered_index_->begin(), ordered_index_->end(),
+                            ordered_index_->rbegin(), ordered_index_->rend(), lock);
     }
 
     // top_k / bottom_k helpers (ids)
@@ -937,6 +989,10 @@ private:
     // push helper
     [[nodiscard]] id_type push_one(elem1_type e1, elem2_type e2, typename ElemRecord::key_storage_t key) {
         id_type id = nextId_.fetch_add(1, std::memory_order_relaxed);
+        typename ElemRecord::key_storage_t key_copy{};
+        if constexpr (!std::is_same_v<KeyT, std::monostate>) {
+            key_copy = key;
+        }
 
         reaction::Var<elem1_type> v1 = reaction::var(e1);
         reaction::Var<elem2_type> v2 = reaction::var(e2);
@@ -951,10 +1007,13 @@ private:
         elem_count_.fetch_add(1, std::memory_order_relaxed);
 
         if constexpr (!std::is_same_v<KeyT, std::monostate>) {
-            // Copy key outside callback to avoid nested cross-map locks
-            typename ElemRecord::key_storage_t inserted_key{};
-            elems_.if_contains(id, [&](const auto &pair) { inserted_key = pair.second.key; });
-            key_index_.insert(std::make_pair(std::move(inserted_key), id));
+            // Reject duplicate keys and roll back element insertion if key exists.
+            auto ins = key_index_.insert(std::make_pair(std::move(key_copy), id));
+            if (!ins.second) {
+                elems_.erase(id);
+                elem_count_.fetch_sub(1, std::memory_order_relaxed);
+                throw std::invalid_argument("push_back: duplicate key");
+            }
         }
 
         if constexpr (MaintainOrderedIndex) {
@@ -1003,7 +1062,7 @@ private:
                 // Compute all values inside modify_if; ordered index & apply_pair stay outside
                 elem1_type old_e1{};
                 elem2_type old_e2{};
-                bool need_reinsert = true;
+                bool have_ordered_data = false;
                 delta1_type dd1{};
                 delta2_type dd2{};
                 std::optional<total1_type> old_ext1, new_ext1;
@@ -1016,8 +1075,7 @@ private:
                     old_e2 = r.lastElem2;
 
                     if constexpr (MaintainOrderedIndex) {
-                        bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
-                        need_reinsert = !equiv;
+                        have_ordered_data = true;
                     }
 
                     dd1 = delta1_copy(ne1, ne2, old_e1, old_e2);
@@ -1038,13 +1096,17 @@ private:
                 });
                 if (!found) return;
 
-                // Update ordered index outside the element lock
+                // Update ordered index outside the element lock.
+                // Compare and mutate under ordered_mtx_ to avoid races with set_compare/rebuild.
                 if constexpr (MaintainOrderedIndex) {
-                    if (ordered_index_) {
-                        if (need_reinsert) {
-                            std::unique_lock<std::shared_mutex> lock(this->ordered_mtx_);
-                            ordered_index_->erase(id);
-                            ordered_index_->insert(id);
+                    if (have_ordered_data) {
+                        std::unique_lock<std::shared_mutex> lock(this->ordered_mtx_);
+                        if (ordered_index_) {
+                            bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
+                            if (!equiv) {
+                                ordered_index_->erase(id);
+                                ordered_index_->insert(id);
+                            }
                         }
                     }
                 }

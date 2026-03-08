@@ -22,7 +22,7 @@ A high-performance, thread-safe C++20 template library for reactive aggregation 
 ### Operation Complexity
 | Operation | Time Complexity | Thread Safety |
 |-----------|-----------------|---------------|
-| `push_one()` | O(1) avg hash + O(log n) ordered | Thread-safe, writers serialize |
+| `push_back()` | O(1) avg hash + O(log n) ordered | Thread-safe, writers serialize |
 | `erase()` | O(1) avg hash + O(log n) ordered | Thread-safe, writers serialize |
 | `find_by_key()` | O(1) avg | Lock-free |
 | `size()` / `empty()` | O(1) | Lock-free |
@@ -42,9 +42,9 @@ using namespace reactive;
 ReactiveTwoFieldCollection<double, long> collection;
 
 // Insert elements
-auto id1 = collection.push_one(1.5, 10);
-auto id2 = collection.push_one(2.0, 20);
-auto id3 = collection.push_one(0.5, 15);
+auto id1 = collection.push_back(1.5, 10);
+auto id2 = collection.push_back(2.0, 20);
+auto id3 = collection.push_back(0.5, 15);
 
 // Query aggregates (lock-free reads)
 std::cout << "Size: " << collection.size() << "\n";              // 3
@@ -76,13 +76,14 @@ ReactiveTwoFieldCollection<
     /* MaintainOrderedIndex */ true  // Enable ordered iteration
 > orderedCollection;
 
-orderedCollection.push_one(3.0, 5);
-orderedCollection.push_one(1.0, 10);
-orderedCollection.push_one(2.0, 20);
+orderedCollection.push_back(3.0, 5);
+orderedCollection.push_back(1.0, 10);
+orderedCollection.push_back(2.0, 20);
 
 // Iterate in sorted order (multiple threads can iterate concurrently!)
-for (auto it = orderedCollection.ordered_begin(); 
-     it != orderedCollection.ordered_end(); ++it) {
+// ordered() returns a lock-owning view so begin/end share one lock instance.
+auto orderedView = orderedCollection.ordered();
+for (auto it = orderedView.begin(); it != orderedView.end(); ++it) {
     auto [id, snapshot] = *it;
     std::cout << "ID: " << id 
               << " elem1: " << snapshot.lastElem1
@@ -91,6 +92,17 @@ for (auto it = orderedCollection.ordered_begin();
 
 // Query top-k elements
 auto top3 = orderedCollection.top_k(3);
+```
+
+### Changing Comparator at Runtime
+
+```cpp
+orderedCollection.set_compare([](double a1, long /*a2*/, double b1, long /*b2*/) {
+    return a1 > b1;
+});
+
+auto orderedNow = orderedCollection.ordered();
+auto [topId, top] = *orderedNow.begin();
 ```
 
 ### With Key-Based Lookup
@@ -108,8 +120,12 @@ ReactiveTwoFieldCollection<
 > keyedCollection;
 
 // Insert with keys
-auto id1 = keyedCollection.push_one(1.5, 10, "sensor_1");
-auto id2 = keyedCollection.push_one(2.0, 20, "sensor_2");
+auto id1 = keyedCollection.push_back(1.5, 10, "sensor_1");
+auto id2 = keyedCollection.push_back(2.0, 20, "sensor_2");
+// keyedCollection.push_back(3.0, 30, "sensor_1"); // throws std::invalid_argument (duplicate key)
+
+// Batch insert with keys also validates uniqueness and existing-key conflicts before writing.
+// Under concurrent writers, batch insertion is not transactional; a race can still fail mid-batch.
 
 // Fast O(1) lock-free lookup
 auto found = keyedCollection.find_by_key("sensor_1");
@@ -124,12 +140,12 @@ if (found) {
 ReactiveTwoFieldCollection<double, long> collection;
 
 // React to total changes
-auto monitor = collection.total1_var().monitor([](long newTotal) {
+auto monitor = collection.total1Var().monitor([](long newTotal) {
     std::cout << "Total changed to: " << newTotal << "\n";
 });
 
-collection.push_one(1.0, 5);   // Prints: "Total changed to: 5"
-collection.push_one(2.0, 10);  // Prints: "Total changed to: 15"
+collection.push_back(1.0, 5);   // Prints: "Total changed to: 5"
+collection.push_back(2.0, 10);  // Prints: "Total changed to: 15"
 ```
 
 ## Requirements
@@ -187,7 +203,7 @@ cmake --build build
 
 ┌─────────────────────────────────────────────────────┐
 │            Serialized Operations                     │
-│  - push_one() / erase() on ordered index            │
+│  - push_back() / erase() on ordered index           │
 │  - Total aggregate updates (for Min/Max modes)      │
 │  → Writers acquire exclusive locks                  │
 └─────────────────────────────────────────────────────┘
@@ -208,13 +224,16 @@ Perfect for scenarios where:
 
 ```cpp
 // Element Management
-[[nodiscard]] id_type push_one(elem1_type e1, elem2_type e2, key_type key = {});
-bool erase(id_type id);
+[[nodiscard]] id_type push_back(elem1_type e1, elem2_type e2, key_type key = {});
+void erase(id_type id);
 
 // Queries (Lock-Free)
 [[nodiscard]] size_t size() const noexcept;
 [[nodiscard]] bool empty() const noexcept;
 [[nodiscard]] std::optional<id_type> find_by_key(const KeyT& key) const;  // if KeyT != monostate
+// Keyed collections require unique keys:
+// - push_back(..., key) throws std::invalid_argument on duplicates
+// - push_back(batch, keys) pre-validates duplicates/conflicts before writes
 
 // Aggregates (Lock-Free for Add mode)
 [[nodiscard]] total1_type total1() const;
@@ -223,13 +242,13 @@ bool erase(id_type id);
 [[nodiscard]] reaction::Var<total2_type>& total2Var() noexcept;
 
 // Ordered Iteration (Concurrent Reads)
-[[nodiscard]] OrderedConstIterator ordered_begin() const;  // if MaintainOrderedIndex
-[[nodiscard]] OrderedConstIterator ordered_end() const;
+[[nodiscard]] OrderedConstRange ordered() const;  // lock-owning ordered view
+[[nodiscard]] OrderedRange ordered();             // mutable lock-owning ordered view
 [[nodiscard]] std::vector<id_type> top_k(size_t k) const;
 [[nodiscard]] std::vector<id_type> bottom_k(size_t k) const;
 
 // Comparator Management
-void reset(compare_fn_t new_cmp);  // Change ordering dynamically
+void set_compare(compare_fn_t new_cmp);  // Change ordering dynamically
 void rebuild_ordered_index();       // Rebuild after bulk updates
 ```
 
@@ -260,7 +279,7 @@ class ReactiveTwoFieldCollection;
 
 ## Examples
 
-See the `examples/` directory (or `main.cpp` and `test_lock_free.cpp`) for:
+See `main.cpp` and `test_lock_free.cpp` for:
 - Basic usage
 - Ordered iteration
 - Min/Max aggregation
