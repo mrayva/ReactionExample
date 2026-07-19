@@ -4,12 +4,35 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
 #include "reactive_two_field_collection.h"
 
 using namespace reactive;
+
+struct DeltaWithoutTypeAlias {
+    long operator()(double /*new1*/, long new2, double /*old1*/, long old2) const noexcept {
+        return new2 - old2;
+    }
+};
+
+static_assert(std::is_same_v<detail::deduced_delta_t<long, DeltaWithoutTypeAlias>, long>);
+
+void test_delta_without_type_alias_uses_total_type() {
+    using Coll = ReactiveTwoFieldCollection<
+        double, long, long, double,
+        DeltaWithoutTypeAlias
+    >;
+
+    Coll c;
+    const auto id = c.push_back(2.0, 10);
+    assert(c.total1() == 10);
+
+    c.elem2Var(id).value(25);
+    assert(c.total1() == 25);
+}
 
 void test_erase_by_key_no_deadlock() {
     using Coll = ReactiveTwoFieldCollection<
@@ -431,6 +454,7 @@ void test_ordered_view_remains_sorted_during_updates() {
 }
 
 int main() {
+    test_delta_without_type_alias_uses_total_type();
     test_erase_by_key_no_deadlock();
     test_ordered_iterator_holds_shared_lock();
     test_duplicate_key_rejected();

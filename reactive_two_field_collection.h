@@ -125,12 +125,20 @@ struct SaturatingApply {
     }
 };
 
-// Deduce delta type: prefer DeltaFn::DeltaType if present, otherwise fallback to TotalT
+// Deduce delta type: prefer DeltaFn::DeltaType if present, otherwise fallback to TotalT.
+template <typename TotalT, typename DeltaFn, typename = void>
+struct deduced_delta {
+    using type = TotalT;
+};
+
 template <typename TotalT, typename DeltaFn>
-using deduced_delta_t = std::conditional_t<
-    std::is_class_v<DeltaFn> && !std::is_same_v<void, typename DeltaFn::DeltaType>,
-    typename DeltaFn::DeltaType,
-    TotalT>;
+struct deduced_delta<TotalT, DeltaFn, std::void_t<typename DeltaFn::DeltaType>> {
+    using candidate_type = typename DeltaFn::DeltaType;
+    using type = std::conditional_t<std::is_void_v<candidate_type>, TotalT, candidate_type>;
+};
+
+template <typename TotalT, typename DeltaFn>
+using deduced_delta_t = typename deduced_delta<TotalT, DeltaFn>::type;
 
 } // namespace detail
 
