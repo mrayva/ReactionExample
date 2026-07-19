@@ -21,6 +21,19 @@ struct DeltaWithoutTypeAlias {
 
 static_assert(std::is_same_v<detail::deduced_delta_t<long, DeltaWithoutTypeAlias>, long>);
 
+void test_default_arithmetic_wraps_without_signed_overflow() {
+    detail::DefaultApplyAdd<int> apply;
+    int total = std::numeric_limits<int>::max();
+    assert(apply(total, 1));
+    assert(total == std::numeric_limits<int>::lowest());
+
+    detail::DefaultDelta1<int, int, int> delta1;
+    assert(delta1(0, std::numeric_limits<int>::lowest(), 0, std::numeric_limits<int>::max()) == 1);
+
+    detail::DefaultDelta2<int, int, int> delta2;
+    assert(delta2(std::numeric_limits<int>::max(), 2, 0, 0) == -2);
+}
+
 void test_saturating_apply_avoids_integral_overflow() {
     detail::SaturatingApply<int> apply;
 
@@ -473,6 +486,7 @@ void test_ordered_view_remains_sorted_during_updates() {
 }
 
 int main() {
+    test_default_arithmetic_wraps_without_signed_overflow();
     test_saturating_apply_avoids_integral_overflow();
     test_delta_without_type_alias_uses_total_type();
     test_erase_by_key_no_deadlock();

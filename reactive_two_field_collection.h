@@ -47,13 +47,43 @@ enum class AggMode { Add, Min, Max };
 
 namespace detail {
 
+template <typename T>
+constexpr T wrapping_add(T lhs, T rhs) noexcept(noexcept(lhs + rhs)) {
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>) {
+        using unsigned_type = std::make_unsigned_t<T>;
+        return static_cast<T>(static_cast<unsigned_type>(lhs) + static_cast<unsigned_type>(rhs));
+    } else {
+        return static_cast<T>(lhs + rhs);
+    }
+}
+
+template <typename T>
+constexpr T wrapping_subtract(T lhs, T rhs) noexcept(noexcept(lhs - rhs)) {
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>) {
+        using unsigned_type = std::make_unsigned_t<T>;
+        return static_cast<T>(static_cast<unsigned_type>(lhs) - static_cast<unsigned_type>(rhs));
+    } else {
+        return static_cast<T>(lhs - rhs);
+    }
+}
+
+template <typename T>
+constexpr T wrapping_multiply(T lhs, T rhs) noexcept(noexcept(lhs * rhs)) {
+    if constexpr (std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>) {
+        using unsigned_type = std::make_unsigned_t<T>;
+        return static_cast<T>(static_cast<unsigned_type>(lhs) * static_cast<unsigned_type>(rhs));
+    } else {
+        return static_cast<T>(lhs * rhs);
+    }
+}
+
 // DefaultDelta1: Δ = new2 - last2 (typical)
 template <typename Elem1T, typename Elem2T, typename Total1T = Elem2T>
 struct DefaultDelta1 {
     using DeltaType = Total1T;
     constexpr DeltaType operator()(const Elem1T& /*new1*/, const Elem2T &new2,
                                    const Elem1T& /*last1*/, const Elem2T &last2) const noexcept {
-        return static_cast<DeltaType>(new2 - last2);
+        return wrapping_subtract(static_cast<DeltaType>(new2), static_cast<DeltaType>(last2));
     }
 };
 
@@ -63,8 +93,9 @@ struct DefaultDelta2 {
     using DeltaType = Total2T;
     constexpr DeltaType operator()(const Elem1T &new1, const Elem2T &new2,
                                    const Elem1T &last1, const Elem2T &last2) const noexcept {
-        return static_cast<DeltaType>(static_cast<Total2T>(new2) * static_cast<Total2T>(new1)
-                                      - static_cast<Total2T>(last2) * static_cast<Total2T>(last1));
+        const auto current = wrapping_multiply(static_cast<DeltaType>(new2), static_cast<DeltaType>(new1));
+        const auto previous = wrapping_multiply(static_cast<DeltaType>(last2), static_cast<DeltaType>(last1));
+        return wrapping_subtract(current, previous);
     }
 };
 
@@ -73,7 +104,7 @@ template <typename TotalT, typename DeltaT = TotalT>
 struct DefaultApplyAdd {
     using DeltaType = DeltaT;
     constexpr bool operator()(TotalT &total, const DeltaT &d) const noexcept {
-        total += d;
+        total = wrapping_add(total, static_cast<TotalT>(d));
         return true;
     }
 };

@@ -279,6 +279,8 @@ template <
 class ReactiveTwoFieldCollection;
 ```
 
+The default delta and apply functors use modulo arithmetic for integral aggregate types, avoiding undefined signed overflow. Use `detail::SaturatingApply` or a custom apply functor when clamping or checked-overflow behavior is required.
+
 ## Examples
 
 See `main.cpp` and `test_lock_free.cpp` for:
