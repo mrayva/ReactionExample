@@ -443,6 +443,7 @@ public:
     // erase by id
     void erase(id_type id) {
         auto lk = maybe_lock();
+        std::lock_guard<std::recursive_mutex> element_guard(element_mtx_);
 
         // Snapshot element data via if_contains
         std::optional<total1_type> old_ext1;
@@ -451,7 +452,7 @@ public:
         delta2_type rem2{};
         typename ElemRecord::key_storage_t key_to_erase{};
         bool found = false;
-        elems_.if_contains(id, [&](const auto &pair) {
+        auto snapshot = [&](const auto &pair) {
             const ElemRecord &rec = pair.second;
             if constexpr (Total1Mode != AggMode::Add) old_ext1 = extract1_(rec.lastElem1, rec.lastElem2);
             if constexpr (Total2Mode != AggMode::Add) old_ext2 = extract2_(rec.lastElem1, rec.lastElem2);
@@ -461,22 +462,19 @@ public:
                 key_to_erase = rec.key;
             }
             found = true;
-        });
-        if (!found) return;
+        };
 
         if constexpr (MaintainOrderedIndex) {
-            // Phase 3: unique_lock for write operations
+            // Keep comparator-visible element state stable until the id leaves the tree.
             std::unique_lock<std::shared_mutex> lock(ordered_mtx_);
-            if (ordered_index_) {
+            elems_.if_contains(id, snapshot);
+            if (found && ordered_index_) {
                 ordered_index_->erase(id);
             }
+        } else {
+            elems_.if_contains(id, snapshot);
         }
-
-        apply_pair(rem1, rem2,
-                   /*have_old1*/ bool(old_ext1), old_ext1 ? &*old_ext1 : nullptr,
-                   /*have_new1*/ false, nullptr,
-                   /*have_old2*/ bool(old_ext2), old_ext2 ? &*old_ext2 : nullptr,
-                   /*have_new2*/ false, nullptr);
+        if (!found) return;
 
         if constexpr (!std::is_same_v<KeyT, std::monostate>) {
             key_index_.erase(key_to_erase);
@@ -485,11 +483,15 @@ public:
         // Erase monitor: close action inside erase_if callback
         monitors_.erase_if(id, [](auto &pair) { pair.second.close(); return true; });
         
-        // Finally erase element
-        elems_.erase(id);
-        
-        // Decrement atomic element counter
+        // Only the thread that actually removes the record updates counters and totals.
+        if (elems_.erase(id) == 0) return;
         elem_count_.fetch_sub(1, std::memory_order_relaxed);
+
+        apply_pair(rem1, rem2,
+                   /*have_old1*/ bool(old_ext1), old_ext1 ? &*old_ext1 : nullptr,
+                   /*have_new1*/ false, nullptr,
+                   /*have_old2*/ bool(old_ext2), old_ext2 ? &*old_ext2 : nullptr,
+                   /*have_new2*/ false, nullptr);
     }
 
     // erase by key (enabled if KeyT != void)
@@ -527,19 +529,19 @@ public:
         return std::nullopt;
     }
 
-    // Var accessors — node-based map guarantees pointer stability after rehash
-    reaction::Var<elem1_type> &elem1Var(id_type id) {
+    // Return a copyable Var handle so its lifetime is independent of map-node erasure.
+    reaction::Var<elem1_type> elem1Var(id_type id) {
         auto lk = maybe_lock();
-        reaction::Var<elem1_type> *ptr = nullptr;
-        elems_.modify_if(id, [&](auto &pair) { ptr = &pair.second.elem1Var; });
-        if (ptr) return *ptr;
+        std::optional<reaction::Var<elem1_type>> result;
+        elems_.if_contains(id, [&](const auto &pair) { result.emplace(pair.second.elem1Var); });
+        if (result) return std::move(*result);
         throw std::out_of_range("elem1Var: id not found");
     }
-    reaction::Var<elem2_type> &elem2Var(id_type id) {
+    reaction::Var<elem2_type> elem2Var(id_type id) {
         auto lk = maybe_lock();
-        reaction::Var<elem2_type> *ptr = nullptr;
-        elems_.modify_if(id, [&](auto &pair) { ptr = &pair.second.elem2Var; });
-        if (ptr) return *ptr;
+        std::optional<reaction::Var<elem2_type>> result;
+        elems_.if_contains(id, [&](const auto &pair) { result.emplace(pair.second.elem2Var); });
+        if (result) return std::move(*result);
         throw std::out_of_range("elem2Var: id not found");
     }
 
@@ -1032,9 +1034,13 @@ private:
         if constexpr (Total1Mode != AggMode::Add) new_ext1 = extract1_(e1, e2);
         if constexpr (Total2Mode != AggMode::Add) new_ext2 = extract2_(e1, e2);
 
-        apply_pair(d1, d2,
-                   /*old1*/ false, nullptr, /*new1*/ bool(new_ext1), new_ext1 ? &*new_ext1 : nullptr,
-                   /*old2*/ false, nullptr, /*new2*/ bool(new_ext2), new_ext2 ? &*new_ext2 : nullptr);
+        {
+            // Serialize aggregate/index transitions with reactive updates and erase.
+            std::lock_guard<std::recursive_mutex> element_guard(element_mtx_);
+            apply_pair(d1, d2,
+                       /*old1*/ false, nullptr, /*new1*/ bool(new_ext1), new_ext1 ? &*new_ext1 : nullptr,
+                       /*old2*/ false, nullptr, /*new2*/ bool(new_ext2), new_ext2 ? &*new_ext2 : nullptr);
+        }
 
         // Get stable pointers to the Vars (node-based map guarantees pointer stability)
         reaction::Var<elem1_type> *var1_ptr = nullptr;
@@ -1056,31 +1062,25 @@ private:
 
         monitors_.insert(std::make_pair(id, reaction::action(
             [this, id, delta1_copy, delta2_copy, extract1_copy, extract2_copy](elem1_type new1, elem2_type new2) {
+                std::lock_guard<std::recursive_mutex> element_guard(this->element_mtx_);
+                (void)extract1_copy;
+                (void)extract2_copy;
                 elem1_type ne1 = static_cast<elem1_type>(new1);
                 elem2_type ne2 = static_cast<elem2_type>(new2);
 
-                // Compute all values inside modify_if; ordered index & apply_pair stay outside
                 elem1_type old_e1{};
                 elem2_type old_e2{};
-                bool have_ordered_data = false;
                 delta1_type dd1{};
                 delta2_type dd2{};
                 std::optional<total1_type> old_ext1, new_ext1;
                 std::optional<total2_type> old_ext2, new_ext2;
                 bool found = false;
 
-                elems_.modify_if(id, [&](auto &pair) {
-                    ElemRecord &r = pair.second;
+                auto compute_change = [&](const ElemRecord &r) {
                     old_e1 = r.lastElem1;
                     old_e2 = r.lastElem2;
-
-                    if constexpr (MaintainOrderedIndex) {
-                        have_ordered_data = true;
-                    }
-
                     dd1 = delta1_copy(ne1, ne2, old_e1, old_e2);
                     dd2 = delta2_copy(ne1, ne2, old_e1, old_e2);
-
                     if constexpr (Total1Mode != AggMode::Add) {
                         old_ext1 = extract1_copy(old_e1, old_e2);
                         new_ext1 = extract1_copy(ne1, ne2);
@@ -1089,26 +1089,36 @@ private:
                         old_ext2 = extract2_copy(old_e1, old_e2);
                         new_ext2 = extract2_copy(ne1, ne2);
                     }
-
-                    r.lastElem1 = ne1;
-                    r.lastElem2 = ne2;
                     found = true;
-                });
-                if (!found) return;
+                };
 
-                // Update ordered index outside the element lock.
-                // Compare and mutate under ordered_mtx_ to avoid races with set_compare/rebuild.
                 if constexpr (MaintainOrderedIndex) {
-                    if (have_ordered_data) {
-                        std::unique_lock<std::shared_mutex> lock(this->ordered_mtx_);
-                        if (ordered_index_) {
-                            bool equiv = (!cmp_(old_e1, old_e2, ne1, ne2) && !cmp_(ne1, ne2, old_e1, old_e2));
-                            if (!equiv) {
-                                ordered_index_->erase(id);
-                                ordered_index_->insert(id);
-                            }
-                        }
+                    // Remove with the old comparator-visible values, mutate, then reinsert.
+                    std::unique_lock<std::shared_mutex> lock(this->ordered_mtx_);
+                    elems_.if_contains(id, [&](const auto &pair) { compute_change(pair.second); });
+                    if (!found) return;
+
+                    bool equivalent = (!cmp_(old_e1, old_e2, ne1, ne2) &&
+                                       !cmp_(ne1, ne2, old_e1, old_e2));
+                    if (!equivalent && ordered_index_) {
+                        ordered_index_->erase(id);
                     }
+                    elems_.modify_if(id, [&](auto &pair) {
+                        pair.second.lastElem1 = ne1;
+                        pair.second.lastElem2 = ne2;
+                    });
+                    if (!equivalent && ordered_index_) {
+                        ordered_index_->insert(id);
+                    }
+                } else {
+                    elems_.modify_if(id, [&](auto &pair) {
+                        compute_change(pair.second);
+                        if (found) {
+                            pair.second.lastElem1 = ne1;
+                            pair.second.lastElem2 = ne2;
+                        }
+                    });
+                    if (!found) return;
                 }
 
                 apply_pair(dd1, dd2,
@@ -1164,6 +1174,9 @@ private:
 
     mutable std::mutex coarse_mtx_;
     bool coarse_lock_enabled_;
+
+    // Serializes per-element reactive updates and erase lifecycles.
+    std::recursive_mutex element_mtx_;
 
     key_index_map_type key_index_{};
 

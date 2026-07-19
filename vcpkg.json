@@ -1,9 +1,16 @@
 {
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "reaction-example",
   "version-string": "0.1.0",
+  "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc",
   "dependencies": [
-    "reaction",
-    "catch2",
-    "parallel-hashmap"
+    {
+      "name": "reaction",
+      "version>=": "1.0.0"
+    },
+    {
+      "name": "parallel-hashmap",
+      "version>=": "2.0.0"
+    }
   ]
 }

@@ -6,7 +6,7 @@ A high-performance, thread-safe C++20 template library for reactive aggregation 
 
 - **Lock-Free Operations**: ID generation, size tracking, and hash map operations use atomic primitives and parallel-hashmap concurrent data structures
 - **Concurrent Read Access**: Multiple threads can iterate over the ordered index simultaneously (std::shared_mutex)
-- **Reactive Updates**: Automatic aggregate computation via callback system (powered by [reaction library](https://github.com/snncpp/reaction))
+- **Reactive Updates**: Automatic aggregate computation via callback system (powered by [Reaction](https://github.com/lumia431/reaction))
 - **Flexible Aggregation**: Support for Add, Min, and Max aggregation modes on two independent totals
 - **Custom Comparators**: Dynamic comparator changes with automatic reordering
 - **Key-Based Lookup**: Optional O(1) lock-free key-to-element mapping
@@ -177,7 +177,7 @@ cmake --build build
 ### Manual Installation
 
 1. Install [parallel-hashmap](https://github.com/greg7mdp/parallel-hashmap) (header-only)
-2. Install [Reaction](https://github.com/snncpp/reaction)
+2. Install [Reaction](https://github.com/lumia431/reaction)
 3. Include `reactive_two_field_collection.h` in your project
 4. Add parallel-hashmap and Reaction to your include paths
 
@@ -226,6 +226,8 @@ Perfect for scenarios where:
 // Element Management
 [[nodiscard]] id_type push_back(elem1_type e1, elem2_type e2, key_type key = {});
 void erase(id_type id);
+[[nodiscard]] reaction::Var<elem1_type> elem1Var(id_type id);  // lifetime-safe handle copy
+[[nodiscard]] reaction::Var<elem2_type> elem2Var(id_type id);  // lifetime-safe handle copy
 
 // Queries (Lock-Free)
 [[nodiscard]] size_t size() const noexcept;

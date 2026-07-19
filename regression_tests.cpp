@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "reactive_two_field_collection.h"
@@ -294,6 +295,141 @@ void test_keyed_batch_concurrent_conflict_consistency() {
     }
 }
 
+void test_concurrent_duplicate_erase_applies_once() {
+    using Coll = ReactiveTwoFieldCollection<double, long>;
+    Coll c({}, {}, {}, {}, false, false);
+    auto id = c.push_back(3.0, 4);
+
+    constexpr int thread_count = 16;
+    std::atomic<int> ready{0};
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (int i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (ready.load(std::memory_order_acquire) != thread_count) {
+                std::this_thread::yield();
+            }
+            c.erase(id);
+        });
+    }
+    for (auto &thread : threads) thread.join();
+
+    assert(c.size() == 0);
+    assert(c.total1() == 0);
+    assert(c.total2() == 0.0);
+}
+
+void test_var_handle_survives_erase_without_updating_collection() {
+    using Coll = ReactiveTwoFieldCollection<double, long>;
+    Coll c({}, {}, {}, {}, false, false);
+    auto id = c.push_back(2.0, 5);
+    auto elem2 = c.elem2Var(id);
+
+    c.erase(id);
+    elem2.value(99);
+
+    assert(c.size() == 0);
+    assert(c.total1() == 0);
+    assert(c.total2() == 0.0);
+}
+
+void test_concurrent_min_max_updates_without_coarse_lock() {
+    using Coll = ReactiveTwoFieldCollection<
+        double, long, long, double,
+        detail::DefaultDelta1<double, long, long>,
+        detail::DefaultApplyAdd<long>,
+        detail::DefaultDelta2<double, long, double>,
+        detail::DefaultApplyAdd<double>,
+        std::monostate,
+        AggMode::Min, AggMode::Max
+    >;
+
+    Coll c({}, {}, {}, {}, false, false);
+    constexpr int thread_count = 8;
+    constexpr int per_thread = 200;
+    std::vector<std::vector<size_t>> ids(thread_count);
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+
+    for (int t = 0; t < thread_count; ++t) {
+        threads.emplace_back([&, t]() {
+            ids[static_cast<size_t>(t)].reserve(per_thread);
+            for (int i = 0; i < per_thread; ++i) {
+                const long value = static_cast<long>(t * per_thread + i + 1);
+                ids[static_cast<size_t>(t)].push_back(c.push_back(static_cast<double>(value), value));
+            }
+        });
+    }
+    for (auto &thread : threads) thread.join();
+
+    constexpr long max_value = thread_count * per_thread;
+    assert(c.size() == static_cast<size_t>(max_value));
+    assert(c.total1() == 1);
+    assert(c.total2() == static_cast<double>(max_value) * static_cast<double>(max_value));
+
+    threads.clear();
+    for (int t = 0; t < thread_count; ++t) {
+        threads.emplace_back([&, t]() {
+            for (size_t id : ids[static_cast<size_t>(t)]) c.erase(id);
+        });
+    }
+    for (auto &thread : threads) thread.join();
+
+    assert(c.empty());
+    assert(c.total1() == 0);
+    assert(c.total2() == 0.0);
+}
+
+void test_ordered_view_remains_sorted_during_updates() {
+    using Coll = ReactiveTwoFieldCollection<
+        double, long, long, double,
+        detail::DefaultDelta1<double, long, long>,
+        detail::DefaultApplyAdd<long>,
+        detail::DefaultDelta2<double, long, double>,
+        detail::DefaultApplyAdd<double>,
+        std::monostate,
+        AggMode::Add, AggMode::Add,
+        DefaultExtract1<double, long, long>,
+        DefaultExtract2<double, long, double>,
+        false, true
+    >;
+
+    Coll c({}, {}, {}, {}, false, false);
+    std::vector<size_t> ids;
+    ids.reserve(64);
+    for (int i = 0; i < 64; ++i) ids.push_back(c.push_back(static_cast<double>(i), i));
+
+    std::atomic<bool> done{false};
+    std::thread updater([&]() {
+        for (int iter = 0; iter < 3000; ++iter) {
+            const size_t index = static_cast<size_t>(iter) % ids.size();
+            c.elem1Var(ids[index]).value(static_cast<double>((iter * 17) % 101));
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    while (!done.load(std::memory_order_acquire)) {
+        auto ordered = c.ordered();
+        bool have_previous = false;
+        double previous1 = 0.0;
+        long previous2 = 0;
+        for (auto it = ordered.begin(); it != ordered.end(); ++it) {
+            auto [id, record] = *it;
+            (void)id;
+            if (have_previous) {
+                const bool in_order = previous1 < record.lastElem1 ||
+                    (previous1 == record.lastElem1 && previous2 <= record.lastElem2);
+                assert(in_order);
+            }
+            previous1 = record.lastElem1;
+            previous2 = record.lastElem2;
+            have_previous = true;
+        }
+    }
+    updater.join();
+}
+
 int main() {
     test_erase_by_key_no_deadlock();
     test_ordered_iterator_holds_shared_lock();
@@ -303,5 +439,9 @@ int main() {
     test_set_compare_reorders();
     test_set_compare_concurrent_updates_stress();
     test_keyed_batch_concurrent_conflict_consistency();
+    test_concurrent_duplicate_erase_applies_once();
+    test_var_handle_survives_erase_without_updating_collection();
+    test_concurrent_min_max_updates_without_coarse_lock();
+    test_ordered_view_remains_sorted_during_updates();
     return 0;
 }

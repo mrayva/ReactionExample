@@ -35,7 +35,8 @@ jobs:
 
       - name: Setup vcpkg
         run: |
-          git clone https://github.com/microsoft/vcpkg.git "$GITHUB_WORKSPACE/vcpkg"
+          git clone --branch 2026.05.25 --depth 1 \
+            https://github.com/microsoft/vcpkg.git "$GITHUB_WORKSPACE/vcpkg"
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh"
 
       - name: Configure
