@@ -279,7 +279,7 @@ template <
 class ReactiveTwoFieldCollection;
 ```
 
-The default delta and apply functors use modulo arithmetic for integral aggregate types, avoiding undefined signed overflow. Use `detail::SaturatingApply` or a custom apply functor when clamping or checked-overflow behavior is required.
+The built-in functors clamp out-of-range conversions to integral aggregate types; NaN converts to zero. Their integral arithmetic uses modulo semantics, avoiding undefined signed overflow. Use `detail::SaturatingApply` or a custom apply functor when arithmetic results must clamp instead.
 
 ## Examples
 

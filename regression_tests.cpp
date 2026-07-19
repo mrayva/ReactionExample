@@ -21,6 +21,31 @@ struct DeltaWithoutTypeAlias {
 
 static_assert(std::is_same_v<detail::deduced_delta_t<long, DeltaWithoutTypeAlias>, long>);
 
+void test_builtin_numeric_conversions_are_bounded() {
+    const double infinity = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    assert(detail::bounded_numeric_cast<int>(infinity) == std::numeric_limits<int>::max());
+    assert(detail::bounded_numeric_cast<int>(-infinity) == std::numeric_limits<int>::lowest());
+    assert(detail::bounded_numeric_cast<int>(nan) == 0);
+    assert(detail::bounded_numeric_cast<int>(std::numeric_limits<unsigned long long>::max()) ==
+           std::numeric_limits<int>::max());
+    assert(detail::bounded_numeric_cast<unsigned int>(-1LL) == 0U);
+
+    detail::SetApply<int, double> set;
+    int total = 0;
+    assert(set(total, infinity));
+    assert(total == std::numeric_limits<int>::max());
+
+    detail::SaturatingApply<int, double> saturating;
+    total = 1;
+    assert(saturating(total, infinity));
+    assert(total == std::numeric_limits<int>::max());
+
+    DefaultExtract2<double, double, int> extract;
+    assert(extract(infinity, 2.0) == -2);
+}
+
 void test_default_arithmetic_wraps_without_signed_overflow() {
     detail::DefaultApplyAdd<int> apply;
     int total = std::numeric_limits<int>::max();
@@ -486,6 +511,7 @@ void test_ordered_view_remains_sorted_during_updates() {
 }
 
 int main() {
+    test_builtin_numeric_conversions_are_bounded();
     test_default_arithmetic_wraps_without_signed_overflow();
     test_saturating_apply_avoids_integral_overflow();
     test_delta_without_type_alias_uses_total_type();

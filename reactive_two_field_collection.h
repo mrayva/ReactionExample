@@ -47,6 +47,32 @@ enum class AggMode { Add, Min, Max };
 
 namespace detail {
 
+template <typename Target, typename Source>
+constexpr Target bounded_numeric_cast(const Source &value) noexcept {
+    if constexpr (std::is_same_v<std::remove_cv_t<Target>, bool> ||
+                  !std::is_arithmetic_v<Target> || !std::is_arithmetic_v<Source>) {
+        return static_cast<Target>(value);
+    } else if constexpr (std::is_integral_v<Target> && std::is_integral_v<Source>) {
+        if (std::in_range<Target>(value)) return static_cast<Target>(value);
+        if constexpr (std::is_signed_v<Source>) {
+            if (value < 0) return std::numeric_limits<Target>::lowest();
+        }
+        return std::numeric_limits<Target>::max();
+    } else if constexpr (std::is_integral_v<Target> && std::is_floating_point_v<Source>) {
+        const long double expanded = static_cast<long double>(value);
+        if (expanded != expanded) return Target{};
+        if (expanded <= static_cast<long double>(std::numeric_limits<Target>::lowest())) {
+            return std::numeric_limits<Target>::lowest();
+        }
+        if (expanded >= static_cast<long double>(std::numeric_limits<Target>::max())) {
+            return std::numeric_limits<Target>::max();
+        }
+        return static_cast<Target>(value);
+    } else {
+        return static_cast<Target>(value);
+    }
+}
+
 template <typename T>
 constexpr T wrapping_add(T lhs, T rhs) noexcept(noexcept(lhs + rhs)) {
     if constexpr (std::is_integral_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>) {
@@ -83,7 +109,7 @@ struct DefaultDelta1 {
     using DeltaType = Total1T;
     constexpr DeltaType operator()(const Elem1T& /*new1*/, const Elem2T &new2,
                                    const Elem1T& /*last1*/, const Elem2T &last2) const noexcept {
-        return wrapping_subtract(static_cast<DeltaType>(new2), static_cast<DeltaType>(last2));
+        return wrapping_subtract(bounded_numeric_cast<DeltaType>(new2), bounded_numeric_cast<DeltaType>(last2));
     }
 };
 
@@ -93,8 +119,10 @@ struct DefaultDelta2 {
     using DeltaType = Total2T;
     constexpr DeltaType operator()(const Elem1T &new1, const Elem2T &new2,
                                    const Elem1T &last1, const Elem2T &last2) const noexcept {
-        const auto current = wrapping_multiply(static_cast<DeltaType>(new2), static_cast<DeltaType>(new1));
-        const auto previous = wrapping_multiply(static_cast<DeltaType>(last2), static_cast<DeltaType>(last1));
+        const auto current = wrapping_multiply(
+            bounded_numeric_cast<DeltaType>(new2), bounded_numeric_cast<DeltaType>(new1));
+        const auto previous = wrapping_multiply(
+            bounded_numeric_cast<DeltaType>(last2), bounded_numeric_cast<DeltaType>(last1));
         return wrapping_subtract(current, previous);
     }
 };
@@ -104,7 +132,7 @@ template <typename TotalT, typename DeltaT = TotalT>
 struct DefaultApplyAdd {
     using DeltaType = DeltaT;
     constexpr bool operator()(TotalT &total, const DeltaT &d) const noexcept {
-        total = wrapping_add(total, static_cast<TotalT>(d));
+        total = wrapping_add(total, bounded_numeric_cast<TotalT>(d));
         return true;
     }
 };
@@ -131,7 +159,7 @@ template <typename TotalT, typename DeltaT = TotalT>
 struct SetApply {
     using DeltaType = DeltaT;
     constexpr bool operator()(TotalT &total, const DeltaT &d) const noexcept {
-        TotalT v = static_cast<TotalT>(d);
+        TotalT v = bounded_numeric_cast<TotalT>(d);
         if (total == v) return false;
         total = v;
         return true;
@@ -147,7 +175,7 @@ struct SaturatingApply {
     SaturatingApply(TotalT lo = std::numeric_limits<TotalT>::lowest(), TotalT hi = std::numeric_limits<TotalT>::max())
         : minv(lo), maxv(hi) {}
     bool operator()(TotalT &total, const DeltaT &d) const noexcept {
-        const TotalT delta = static_cast<TotalT>(d);
+        const TotalT delta = bounded_numeric_cast<TotalT>(d);
         TotalT nv;
         if constexpr (std::is_integral_v<TotalT>) {
             const auto lowest = std::numeric_limits<TotalT>::lowest();
@@ -199,13 +227,14 @@ using deduced_delta_t = typename deduced_delta<TotalT, DeltaFn>::type;
 template <typename Elem1T, typename Elem2T, typename Total1T>
 struct DefaultExtract1 {
     constexpr Total1T operator()(const Elem1T&, const Elem2T &e2) const noexcept {
-        return static_cast<Total1T>(e2);
+        return detail::bounded_numeric_cast<Total1T>(e2);
     }
 };
 template <typename Elem1T, typename Elem2T, typename Total2T>
 struct DefaultExtract2 {
     constexpr Total2T operator()(const Elem1T &e1, const Elem2T &e2) const noexcept {
-        return static_cast<Total2T>(static_cast<Total2T>(e2) * static_cast<Total2T>(e1));
+        return detail::wrapping_multiply(
+            detail::bounded_numeric_cast<Total2T>(e2), detail::bounded_numeric_cast<Total2T>(e1));
     }
 };
 
