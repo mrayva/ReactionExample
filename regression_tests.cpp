@@ -1,6 +1,7 @@
 #include <cassert>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -19,6 +20,24 @@ struct DeltaWithoutTypeAlias {
 };
 
 static_assert(std::is_same_v<detail::deduced_delta_t<long, DeltaWithoutTypeAlias>, long>);
+
+void test_saturating_apply_avoids_integral_overflow() {
+    detail::SaturatingApply<int> apply;
+
+    int total = std::numeric_limits<int>::max() - 1;
+    assert(apply(total, 10));
+    assert(total == std::numeric_limits<int>::max());
+
+    total = std::numeric_limits<int>::lowest() + 1;
+    assert(apply(total, -10));
+    assert(total == std::numeric_limits<int>::lowest());
+
+    detail::SaturatingApply<int> bounded(-100, 100);
+    total = 90;
+    assert(bounded(total, 20));
+    assert(total == 100);
+    assert(!bounded(total, 20));
+}
 
 void test_delta_without_type_alias_uses_total_type() {
     using Coll = ReactiveTwoFieldCollection<
@@ -454,6 +473,7 @@ void test_ordered_view_remains_sorted_during_updates() {
 }
 
 int main() {
+    test_saturating_apply_avoids_integral_overflow();
     test_delta_without_type_alias_uses_total_type();
     test_erase_by_key_no_deadlock();
     test_ordered_iterator_holds_shared_lock();

@@ -116,7 +116,25 @@ struct SaturatingApply {
     SaturatingApply(TotalT lo = std::numeric_limits<TotalT>::lowest(), TotalT hi = std::numeric_limits<TotalT>::max())
         : minv(lo), maxv(hi) {}
     bool operator()(TotalT &total, const DeltaT &d) const noexcept {
-        TotalT nv = total + static_cast<TotalT>(d);
+        const TotalT delta = static_cast<TotalT>(d);
+        TotalT nv;
+        if constexpr (std::is_integral_v<TotalT>) {
+            const auto lowest = std::numeric_limits<TotalT>::lowest();
+            const auto highest = std::numeric_limits<TotalT>::max();
+            if (delta > 0 && total > static_cast<TotalT>(highest - delta)) {
+                nv = highest;
+            } else if constexpr (std::is_signed_v<TotalT>) {
+                if (delta < 0 && total < static_cast<TotalT>(lowest - delta)) {
+                    nv = lowest;
+                } else {
+                    nv = static_cast<TotalT>(total + delta);
+                }
+            } else {
+                nv = static_cast<TotalT>(total + delta);
+            }
+        } else {
+            nv = static_cast<TotalT>(total + delta);
+        }
         if (nv < minv) nv = minv;
         if (nv > maxv) nv = maxv;
         if (nv == total) return false;
